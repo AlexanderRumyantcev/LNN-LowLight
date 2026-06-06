@@ -1,0 +1,38 @@
+name: retinex_cfc
+temporal_type: cfc  # cfc | lstm | gru | none
+
+model:
+  n_feat: 32
+  stage: 1
+  num_blocks: [1, 1, 1]
+  window_size: 5
+  hidden_dim: 64
+  n_neurons: 32
+  fps: 30.0
+
+dataset:
+  name: lol               # lol | bvi_rlv
+  data_root: ./data/LOL   # путь к датасету
+  patch_size: 128
+  window_size: 5
+  fps: 30.0
+
+train:
+  batch_size: 4
+  num_workers: 2
+  epochs: 200
+  lr: 0.0002
+  lr_min: 0.000001
+  warmup_epochs: 5
+  save_every: 10
+  val_every: 5
+
+loss:
+  lambda_pixel: 1.0
+  lambda_ssim: 0.1
+  lambda_temporal: 0.05
+
+paths:
+  checkpoints: ./experiments/checkpoints/cfc
+  logs: ./experiments/logs/cfc
+  results: ./experiments/results/cfc
