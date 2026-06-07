@@ -1,0 +1,42 @@
+name: retinex_cfc_sdsd
+temporal_type: cfc
+
+model:
+  n_feat: 32
+  stage: 1
+  num_blocks: [1, 1, 1]
+  window_size: 5
+  hidden_dim: 64
+  n_neurons: 32
+  fps: 30.0
+  freeze_backbone: true          # trainable: 749k → 23k
+  backbone_lr_scale: 0.1         # lr backbone = lr * 0.1 при unfreeze
+
+dataset:
+  name: sdsd
+  data_root: ./data/SDSD/outdoor_np  # outdoor — релевантнее для робота
+  patch_size: 128
+  window_size: 5
+  fps: 30.0
+  train_ratio: 0.9
+  seed: 42
+
+train:
+  batch_size: 4
+  num_workers: 2
+  epochs: 100
+  lr: 0.0002
+  lr_min: 0.000001
+  warmup_epochs: 5
+  save_every: 10
+  val_every: 5
+
+loss:
+  lambda_pixel: 1.0
+  lambda_ssim: 0.1
+  lambda_temporal: 0.05
+
+paths:
+  checkpoints: ./experiments/checkpoints/cfc_sdsd
+  logs: ./experiments/logs/cfc_sdsd
+  results: ./experiments/results/cfc_sdsd
