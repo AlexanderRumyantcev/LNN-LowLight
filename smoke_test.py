@@ -200,6 +200,66 @@ check("5b. LSTMTemporalModule isolated", lambda: test_temporal_module(LSTMTempor
 check("5c. GRUTemporalModule isolated",  lambda: test_temporal_module(GRUTemporalModule,  'GRU'))
 
 # ──────────────────────────────────────────────
+# 6. Freeze / unfreeze backbone
+# ──────────────────────────────────────────────
+
+def test_freeze():
+    model = RetinexLNNPipeline(
+        temporal_type='cfc', n_feat=N_FEAT,
+        window_size=T, hidden_dim=64, n_neurons=32,
+    ).to(DEVICE)
+
+    # До заморозки — backbone должен быть trainable
+    params_before = model.get_num_params()
+    assert params_before['trainable_backbone'] > 0, \
+        "До freeze backbone должен быть trainable"
+    ok(f"before freeze: trainable_backbone={params_before['trainable_backbone']}, "
+       f"trainable_temporal={params_before['trainable_temporal']}")
+
+    # Заморозить backbone
+    model.freeze_backbone()
+    params_frozen = model.get_num_params()
+
+    assert params_frozen['trainable_backbone'] == 0, \
+        "После freeze backbone не должно быть trainable backbone параметров"
+    assert params_frozen['trainable_temporal'] > 0, \
+        "Temporal параметры должны оставаться trainable"
+    ok(f"frozen: trainable={params_frozen['trainable']} "
+       f"(temporal={params_frozen['trainable_temporal']}, "
+       f"backbone={params_frozen['trainable_backbone']})")
+
+    # Проверяем что backward работает только через temporal
+    frames, target, timespans = make_batch()
+    pred = model(frames, timespans)
+    pred.mean().backward()
+
+    # У backbone не должно быть градиентов
+    backbone_grads = [p for p in list(model.estimator.parameters()) +
+                      list(model.denoiser.parameters()) if p.grad is not None]
+    assert len(backbone_grads) == 0, \
+        f"У замороженного backbone не должно быть градиентов, нашли {len(backbone_grads)}"
+    ok("backbone grad=None после freeze ✓")
+
+    # Разморозить
+    model.unfreeze_backbone()
+    params_unfrozen = model.get_num_params()
+    assert params_unfrozen['trainable_backbone'] == params_before['trainable_backbone'], \
+        "После unfreeze backbone должен вернуться к исходному состоянию"
+    ok(f"unfrozen: trainable={params_unfrozen['trainable']} ✓")
+
+    # Проверяем get_param_groups
+    groups = model.get_param_groups(lr=2e-4, backbone_lr_scale=0.1)
+    assert len(groups) == 2, f"Должно быть 2 param groups, получили {len(groups)}"
+    temporal_group = next(g for g in groups if g['name'] == 'temporal')
+    backbone_group = next(g for g in groups if g['name'] == 'backbone')
+    assert abs(temporal_group['lr'] - 2e-4) < 1e-9
+    assert abs(backbone_group['lr'] - 2e-5) < 1e-9
+    ok(f"param_groups: temporal lr={temporal_group['lr']:.1e}, "
+       f"backbone lr={backbone_group['lr']:.1e} ✓")
+
+check("6. Freeze / unfreeze backbone", test_freeze)
+
+# ──────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────
 

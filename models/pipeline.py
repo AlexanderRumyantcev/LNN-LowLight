@@ -137,15 +137,77 @@ class RetinexLNNPipeline(nn.Module):
 
         return output_img
 
+    # ──────────────────────────────────────────────
+    # Backbone freeze / unfreeze
+    # ──────────────────────────────────────────────
+
+    def freeze_backbone(self) -> None:
+        """
+        Заморозить RetinexFormer (estimator + denoiser).
+        Обучаться будет только темпоральный модуль (~24k params).
+        Вызывать перед созданием оптимизатора.
+        """
+        for p in self.estimator.parameters():
+            p.requires_grad = False
+        for p in self.denoiser.parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self, lr_scale: float = 0.1) -> None:
+        """
+        Разморозить backbone для fine-tuning.
+
+        Args:
+            lr_scale: напоминание — backbone нужен меньший lr чем temporal.
+                      Передай lr * lr_scale в param_groups оптимизатора.
+        """
+        for p in self.estimator.parameters():
+            p.requires_grad = True
+        for p in self.denoiser.parameters():
+            p.requires_grad = True
+
+    def get_param_groups(self, lr: float, backbone_lr_scale: float = 0.1) -> list:
+        """
+        Вернуть param_groups для оптимизатора с разными lr.
+
+        Использование:
+            optimizer = AdamW(model.get_param_groups(lr=2e-4), ...)
+
+        Args:
+            lr:                базовый lr (для temporal модуля)
+            backbone_lr_scale: множитель lr для backbone (default 0.1)
+        Returns:
+            список param_groups для torch.optim
+        """
+        temporal_params = list(self.temporal.parameters()) if self.temporal else []
+        backbone_params = (
+            list(self.estimator.parameters()) +
+            list(self.denoiser.parameters())
+        )
+        groups = [
+            {'params': temporal_params,  'lr': lr,                        'name': 'temporal'},
+            {'params': backbone_params,  'lr': lr * backbone_lr_scale,    'name': 'backbone'},
+        ]
+        return [g for g in groups if len(g['params']) > 0]
+
+    # ──────────────────────────────────────────────
+    # Утилиты
+    # ──────────────────────────────────────────────
+
     def get_num_params(self) -> dict:
-        """Подсчёт параметров по компонентам."""
-        def count(m):
+        """Подсчёт параметров: всего / trainable / по компонентам."""
+        def count_total(m):
+            return sum(p.numel() for p in m.parameters())
+
+        def count_trainable(m):
             return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
         result = {
-            'estimator': count(self.estimator),
-            'denoiser': count(self.denoiser),
-            'temporal': count(self.temporal) if self.temporal else 0,
+            'estimator':          count_total(self.estimator),
+            'denoiser':           count_total(self.denoiser),
+            'temporal':           count_total(self.temporal) if self.temporal else 0,
+            'trainable_temporal': count_trainable(self.temporal) if self.temporal else 0,
+            'trainable_backbone': count_trainable(self.estimator) + count_trainable(self.denoiser),
         }
-        result['total'] = sum(result.values())
+        result['total']     = result['estimator'] + result['denoiser'] + result['temporal']
+        result['trainable'] = result['trainable_temporal'] + result['trainable_backbone']
         return result
