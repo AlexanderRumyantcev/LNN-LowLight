@@ -114,10 +114,37 @@ class LOLDataset(Dataset):
 class BVIRLVDataset(Dataset):
     """
     BVI-RLV dataset для video enhancement.
-    Основной датасет проекта.
+    Основной датасет проекта (Lin et al., arXiv:2407.03535, 2024).
 
-    Возвращает скользящее окно из window_size кадров (low) + target (high текущего кадра).
+    Реальная структура на диске:
+      data_root/
+        input/
+          S01/
+            low_light_10/   ← слабое освещение, уровень 10
+              00001.png ...
+            low_light_20/   ← слабое освещение, уровень 20
+              00001.png ...
+          S02/ ...
+        gt/
+          S01/
+            normal_light_10/  ← GT для low_light_10
+              00001.png ...
+            normal_light_20/  ← GT для low_light_20
+              00001.png ...
+          S02/ ...
+
+    40 сцен (S01-S40) × 2 уровня освещения = 80 пар последовательностей.
+    Официального train/test split нет — используем train_ratio.
+
+    Возвращает:
+      frames:    [T, 3, H, W]  — окно из T low-light кадров
+      target:    [3, H, W]     — GT текущего кадра
+      timespans: [T]           — ∆t = 1/fps
+      name:      str           — "S01/low_light_10/00005"
     """
+
+    LIGHT_LEVELS = ['low_light_10', 'low_light_20']
+    GT_LEVELS    = ['normal_light_10', 'normal_light_20']
 
     def __init__(
         self,
@@ -127,82 +154,114 @@ class BVIRLVDataset(Dataset):
         patch_size: int = 256,
         augment: bool = True,
         fps: float = 30.0,
+        train_ratio: float = 0.85,
+        seed: int = 42,
     ):
         super().__init__()
         self.window_size = window_size
-        self.patch_size = patch_size
-        self.augment = augment and (split == 'train')
-        self.fps = fps
-        self.dt = 1.0 / fps
+        self.patch_size  = patch_size
+        self.augment     = augment and (split == 'train')
+        self.dt          = 1.0 / fps
 
-        low_root = Path(data_root) / split / 'low'
-        high_root = Path(data_root) / split / 'high'
+        input_root = Path(data_root) / 'input'
+        gt_root    = Path(data_root) / 'gt'
 
-        self.samples = []  # list of (seq_low_paths, seq_high_paths, frame_idx)
+        if not input_root.exists():
+            raise FileNotFoundError(f"BVI-RLV input dir not found: {input_root}")
+        if not gt_root.exists():
+            raise FileNotFoundError(f"BVI-RLV gt dir not found: {gt_root}")
 
-        for seq_dir in sorted(low_root.iterdir()):
-            if not seq_dir.is_dir():
+        # Собираем все (сцена, уровень) пары
+        all_seq_pairs = []
+        for scene_dir in sorted(input_root.iterdir()):
+            if not scene_dir.is_dir():
                 continue
-            high_dir = high_root / seq_dir.name
-            if not high_dir.exists():
+            for ll, nl in zip(self.LIGHT_LEVELS, self.GT_LEVELS):
+                low_dir = scene_dir / ll
+                gt_dir  = gt_root / scene_dir.name / nl
+                if low_dir.exists() and gt_dir.exists():
+                    all_seq_pairs.append((low_dir, gt_dir))
+
+        if not all_seq_pairs:
+            raise RuntimeError(f"BVI-RLV: no sequences found in {data_root}")
+
+        # Детерминированный split
+        rng = random.Random(seed)
+        shuffled = all_seq_pairs.copy()
+        rng.shuffle(shuffled)
+        n_train = max(1, int(len(shuffled) * train_ratio))
+        selected = shuffled[:n_train] if split == 'train' else shuffled[n_train:]
+
+        # Строим сэмплы (скользящее окно)
+        exts = {'.png', '.jpg', '.jpeg'}
+        self.samples = []
+        for low_dir, gt_dir in sorted(selected):
+            low_frames = sorted([p for p in low_dir.iterdir() if p.suffix.lower() in exts])
+            gt_frames  = sorted([p for p in gt_dir.iterdir()  if p.suffix.lower() in exts])
+            n = min(len(low_frames), len(gt_frames))
+            if n < window_size:
                 continue
+            for i in range(window_size - 1, n):
+                window_lq = [low_frames[i - window_size + 1 + j] for j in range(window_size)]
+                target_gt = gt_frames[i]
+                self.samples.append((window_lq, target_gt))
 
-            exts = {'.png', '.jpg', '.jpeg'}
-            low_frames = sorted([p for p in seq_dir.iterdir() if p.suffix in exts])
-            high_frames = sorted([p for p in high_dir.iterdir() if p.suffix in exts])
-
-            if len(low_frames) < window_size:
-                continue
-
-            # Каждый кадр начиная с window_size-1 может быть "текущим"
-            for i in range(window_size - 1, len(low_frames)):
-                self.samples.append((
-                    [str(low_frames[i - window_size + 1 + j]) for j in range(window_size)],
-                    str(high_frames[i]),
-                ))
+        if not self.samples:
+            raise RuntimeError(
+                f"BVIRLVDataset: no samples built (split={split}, "
+                f"sequences={len(selected)}, window={window_size})"
+            )
 
     def __len__(self):
         return len(self.samples)
 
-    def _sync_crop(self, frames_list, high):
-        """Синхронный crop для всей последовательности."""
-        _, H, W = frames_list[0].shape
+    def _sync_crop(self, frames, target):
+        _, H, W = frames[0].shape
         ps = self.patch_size
-        top = random.randint(0, max(0, H - ps))
-        left = random.randint(0, max(0, W - ps))
-        frames_list = [f[:, top:top + ps, left:left + ps] for f in frames_list]
-        high = high[:, top:top + ps, left:left + ps]
-        return frames_list, high
+        if H < ps or W < ps:
+            return frames, target
+        top  = random.randint(0, H - ps)
+        left = random.randint(0, W - ps)
+        frames = [f[:, top:top + ps, left:left + ps] for f in frames]
+        target = target[:, top:top + ps, left:left + ps]
+        return frames, target
 
-    def _sync_augment(self, frames_list, high):
+    def _sync_augment(self, frames, target):
         if random.random() > 0.5:
-            frames_list = [TF.hflip(f) for f in frames_list]
-            high = TF.hflip(high)
+            frames = [TF.hflip(f) for f in frames]
+            target = TF.hflip(target)
         if random.random() > 0.5:
-            frames_list = [TF.vflip(f) for f in frames_list]
-            high = TF.vflip(high)
-        return frames_list, high
+            frames = [TF.vflip(f) for f in frames]
+            target = TF.vflip(target)
+        return frames, target
 
     def __getitem__(self, idx):
-        low_paths, high_path = self.samples[idx]
-
-        low_frames = [load_image(p) for p in low_paths]
-        high = load_image(high_path)
+        lq_paths, gt_path = self.samples[idx]
+        frames = [load_image(str(p)) for p in lq_paths]
+        target = load_image(str(gt_path))
 
         if self.augment:
-            low_frames, high = self._sync_crop(low_frames, high)
-            low_frames, high = self._sync_augment(low_frames, high)
+            frames, target = self._sync_crop(frames, target)
+            frames, target = self._sync_augment(frames, target)
+        elif self.patch_size > 0:
+            _, H, W = frames[0].shape
+            ps = self.patch_size
+            if H >= ps and W >= ps:
+                top  = (H - ps) // 2
+                left = (W - ps) // 2
+                frames = [f[:, top:top + ps, left:left + ps] for f in frames]
+                target = target[:, top:top + ps, left:left + ps]
 
-        frames = torch.stack(low_frames, dim=0)  # [T, 3, H, W]
-
-        # Равномерные timespans: ∆t = 1/fps для каждого шага
-        timespans = torch.full((len(low_paths),), self.dt)
-
+        frames_t   = torch.stack(frames, dim=0)
+        timespans  = torch.full((self.window_size,), self.dt)
+        scene      = lq_paths[-1].parent.parent.name   # S01
+        level      = lq_paths[-1].parent.name          # low_light_10
+        frame_name = lq_paths[-1].stem                 # 00005
         return {
-            'frames': frames,        # [T, 3, H, W]
-            'target': high,          # [3, H, W]
-            'timespans': timespans,  # [T]
-            'name': Path(high_path).stem,
+            'frames':    frames_t,
+            'target':    target,
+            'timespans': timespans,
+            'name':      f"{scene}/{level}/{frame_name}",
         }
 
 
