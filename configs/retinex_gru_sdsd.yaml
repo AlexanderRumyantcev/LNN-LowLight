@@ -1,5 +1,5 @@
-name: retinex_cfc_sdsd
-temporal_type: cfc
+name: retinex_gru_sdsd
+temporal_type: gru
 
 model:
   n_feat: 32
@@ -9,8 +9,8 @@ model:
   hidden_dim: 64
   n_neurons: 32
   fps: 30.0
-  freeze_backbone: true      # trainable: 749k → 23k
-  backbone_lr_scale: 0.1     # lr backbone при unfreeze = lr * 0.1
+  freeze_backbone: true
+  backbone_lr_scale: 0.1
 
 dataset:
   name: sdsd
@@ -30,7 +30,6 @@ train:
   warmup_epochs: 5
   save_every: 10
   val_every: 5
-  # Фаза 2 (fine-tune backbone): unfreeze после epoch 50, lr * backbone_lr_scale
   finetune_epoch: 50
 
 loss:
@@ -39,6 +38,6 @@ loss:
   lambda_temporal: 0.05
 
 paths:
-  checkpoints: ./experiments/checkpoints/cfc_sdsd
-  logs: ./experiments/logs/cfc_sdsd
-  results: ./experiments/results/cfc_sdsd
+  checkpoints: ./experiments/checkpoints/gru_sdsd
+  logs: ./experiments/logs/gru_sdsd
+  results: ./experiments/results/gru_sdsd
