@@ -96,9 +96,8 @@ def sleep():
 def list_directory(prefix: str) -> list[str]:
     """
     Получить список download URL через load-directory API.
-    Ответ — HTML с data-download-url атрибутами вида:
-      /dataport/s3-download-url/11869?key=BASE64==
-    Возвращаем полные URL для скачивания.
+    Ответ — JSON {"html": "...HTML..."} с unicode escapes.
+    В HTML ищем data-download-url атрибуты.
     """
     import re
     encoded = urllib.parse.quote(prefix, safe="")
@@ -107,21 +106,25 @@ def list_directory(prefix: str) -> list[str]:
     if not resp:
         return []
 
-    if "login" in resp.lower() and "SimpleSAML" not in resp:
+    # Распарсить JSON → получить html строку
+    try:
+        data = json.loads(resp)
+        html = data.get("html", "")
+    except json.JSONDecodeError:
+        html = resp
+
+    if not html:
+        return []
+
+    if "login" in html.lower() and "dataport" not in html.lower():
         print("  ⚠️  Сессия истекла! Обнови cookies в скрипте.")
         sys.exit(1)
 
-    # Парсим data-download-url из HTML
-    # Пример: data-download-url="\/dataport\/s3-download-url\/11869?key=BASE64"
-    pattern = r'data-download-url=\\"(\/dataport\/s3-download-url\/[^\\]+)\\"'
-    matches = re.findall(pattern, resp)
+    # В HTML ищем data-download-url="\/dataport\/s3-download-url\/..."
+    # После json.loads слеши уже unescaped: \/  →  /
+    matches = re.findall(r'data-download-url="(/dataport/s3-download-url/[^"]+)"', html)
 
-    # Unescape unicode и слеши
-    urls = []
-    for m in matches:
-        clean = m.replace("\\/", "/")
-        urls.append(f"{BASE_URL}{clean}")
-
+    urls = [f"{BASE_URL}{m}" for m in matches]
     return urls
 
 
@@ -150,16 +153,21 @@ def get_filename_from_url(download_url: str) -> str:
 
 
 def resolve_download_url(dataport_url: str) -> str | None:
-    """Получить прямой S3 URL из /dataport/s3-download-url/..."""
+    """Получить прямой S3 URL из /dataport/s3-download-url/...
+    Ответ: {"status":"success","download_url":"https://ieee-dataport.s3..."}
+    """
     resp = make_request(dataport_url)
     if not resp:
         return None
-    # Ответ может быть JSON {"url": "https://..."} или просто строка URL
     try:
         data = json.loads(resp)
-        return data.get("url") or data.get("download_url")
+        # Слеши в URL могут быть escaped: https:\/\/...
+        url = data.get("download_url") or data.get("url")
+        if url:
+            return url.replace("\\/", "/")
     except Exception:
-        return resp.strip() if resp.strip().startswith("http") else None
+        pass
+    return resp.strip() if resp.strip().startswith("http") else None
 
 
 def download_file(dataport_url: str, local_path: Path) -> bool:
