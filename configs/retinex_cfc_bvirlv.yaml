@@ -1,0 +1,48 @@
+name: retinex_cfc_bvirlv
+temporal_type: cfc
+
+model:
+  n_feat: 32
+  stage: 1
+  num_blocks: [1, 1, 1]
+  window_size: 5
+  hidden_dim: 64
+  n_neurons: 32
+  fps: 30.0
+  freeze_backbone: true      # trainable: 749k → 23k
+  backbone_lr_scale: 0.1     # lr backbone при unfreeze = lr * 0.1
+
+dataset:
+  name: bvi_rlv
+  # Оба Kaggle-датасета подключены к ноутбуку одновременно (Add Input).
+  # BVIRLVDataset объединяет сцены из обоих путей в один пул до train/test сплита.
+  data_root:
+    - /kaggle/input/bvi-rlv-low-light-video-dataset-20-scene-subset
+    - /kaggle/input/bvi-rlv-low-light-video-dataset-part-2
+  patch_size: 256
+  window_size: 5
+  fps: 30.0
+  train_ratio: 0.85
+  seed: 42
+
+train:
+  batch_size: 4
+  num_workers: 2
+  epochs: 100
+  lr: 0.0002
+  lr_min: 0.000001
+  warmup_epochs: 5
+  save_every: 10
+  val_every: 5
+  # Фаза 2 (fine-tune backbone): unfreeze после epoch 50, lr * backbone_lr_scale
+  finetune_epoch: 50
+
+loss:
+  lambda_pixel: 1.0
+  lambda_ssim: 0.1
+  lambda_temporal: 0.05
+
+paths:
+  checkpoints: /kaggle/working/experiments/checkpoints/cfc_bvirlv
+  logs: /kaggle/working/experiments/logs/cfc_bvirlv
+  results: /kaggle/working/experiments/results/cfc_bvirlv

@@ -116,39 +116,81 @@ class BVIRLVDataset(Dataset):
     BVI-RLV dataset для video enhancement.
     Основной датасет проекта (Lin et al., arXiv:2407.03535, 2024).
 
-    Реальная структура на диске:
+    Реальная структура на диске (как загружено на Kaggle):
       data_root/
-        input/
-          S01/
-            low_light_10/   ← слабое освещение, уровень 10
+        S02_animals1/
+          S02_animals1/        ← двойная вложенность из-за архивирования (zip
+                                  содержал папку сцены, Kaggle добавил ещё один
+                                  уровень при распаковке) — поддерживается ниже
+            low_light_10/      ← слабое освещение, уровень 10
               00001.png ...
-            low_light_20/   ← слабое освещение, уровень 20
+            low_light_20/      ← слабое освещение, уровень 20
               00001.png ...
-          S02/ ...
-        gt/
-          S01/
-            normal_light_10/  ← GT для low_light_10
+            normal_light_10/   ← GT для low_light_10 (в той же папке сцены!)
               00001.png ...
-            normal_light_20/  ← GT для low_light_20
+            normal_light_20/   ← GT для low_light_20
               00001.png ...
-          S02/ ...
+        S03_animals2/
+          S03_animals2/ ...
+        ...
 
-    40 сцен (S01-S40) × 2 уровня освещения = 80 пар последовательностей.
-    Официального train/test split нет — используем train_ratio.
+    В отличие от многих датасетов, здесь НЕТ верхнеуровневого разделения на
+    input/ и gt/ — low-light и normal-light (GT) кадры лежат рядом, внутри
+    одной папки сцены, как подпапки low_light_* / normal_light_*.
+
+    Класс терпим к обоим вариантам вложенности:
+      data_root/SceneName/low_light_10/...              (без дублирования)
+      data_root/SceneName/SceneName/low_light_10/...    (с дублированием, как сейчас на Kaggle)
+
+    20 сцен × 2 уровня освещения = 40 пар последовательностей (в текущем подсете;
+    официального train/test split нет — используем train_ratio).
+
+    data_root может быть одним путём (str) или списком путей (list[str]) — второе
+    используется, когда сцены разбиты по нескольким Kaggle-датасетам (например,
+    подключены и -20-scene-subset, и -part-2 к одному ноутбуку) — все сцены со всех
+    указанных каталогов объединяются в один пул до train/test сплита.
 
     Возвращает:
       frames:    [T, 3, H, W]  — окно из T low-light кадров
       target:    [3, H, W]     — GT текущего кадра
       timespans: [T]           — ∆t = 1/fps
-      name:      str           — "S01/low_light_10/00005"
+      name:      str           — "S02_animals1/low_light_10/00005"
     """
 
     LIGHT_LEVELS = ['low_light_10', 'low_light_20']
     GT_LEVELS    = ['normal_light_10', 'normal_light_20']
 
+    @staticmethod
+    def _resolve_scene_content_dir(scene_dir: Path) -> Path:
+        """
+        Возвращает папку, где реально лежат low_light_*/normal_light_* подпапки.
+
+        Если scene_dir сразу содержит low_light_10 и т.п. — возвращает scene_dir.
+        Если внутри scene_dir есть ровно одна подпапка с тем же именем, в которой
+        и лежат low_light_*/normal_light_* — это случай двойной вложенности
+        (SceneName/SceneName/...), и нужно "спуститься" на уровень глубже.
+        """
+        if (scene_dir / 'low_light_10').exists() or (scene_dir / 'low_light_20').exists():
+            return scene_dir
+
+        nested = scene_dir / scene_dir.name
+        if nested.is_dir() and (
+            (nested / 'low_light_10').exists() or (nested / 'low_light_20').exists()
+        ):
+            return nested
+
+        # Фоллбэк: одна-единственная подпапка-обёртка с любым именем
+        subdirs = [d for d in scene_dir.iterdir() if d.is_dir()]
+        if len(subdirs) == 1 and (
+            (subdirs[0] / 'low_light_10').exists() or (subdirs[0] / 'low_light_20').exists()
+        ):
+            return subdirs[0]
+
+        return scene_dir  # ничего не нашли — вызывающий код сам разберётся (пропустит сцену)
+
     def __init__(
         self,
-        data_root: str,
+        data_root,
         split: str = 'train',
         window_size: int = 5,
         patch_size: int = 256,
@@ -157,33 +199,57 @@ class BVIRLVDataset(Dataset):
         train_ratio: float = 0.85,
         seed: int = 42,
     ):
+        """
+        data_root: путь к папке с сценами (str) ЛИБО список таких путей (list[str]).
+        Список нужен, когда сцены распределены по разным Kaggle-датасетам
+        (например /kaggle/input/bvi-rlv-...-20-scene-subset и
+        /kaggle/input/bvi-rlv-...-part-2) — оба источника объединяются в один пул
+        сцен до train/test сплита, без каких-либо копирований/symlink на диске.
+        """
         super().__init__()
         self.window_size = window_size
         self.patch_size  = patch_size
         self.augment     = augment and (split == 'train')
         self.dt          = 1.0 / fps
 
-        input_root = Path(data_root) / 'input'
-        gt_root    = Path(data_root) / 'gt'
+        data_roots = [data_root] if isinstance(data_root, (str, Path)) else list(data_root)
+        data_roots = [Path(r) for r in data_roots]
+        for r in data_roots:
+            if not r.exists():
+                raise FileNotFoundError(f"BVI-RLV data_root not found: {r}")
 
-        if not input_root.exists():
-            raise FileNotFoundError(f"BVI-RLV input dir not found: {input_root}")
-        if not gt_root.exists():
-            raise FileNotFoundError(f"BVI-RLV gt dir not found: {gt_root}")
-
-        # Собираем все (сцена, уровень) пары
+        # Собираем все (сцена, уровень) пары со всех data_roots.
+        # Каждая сцена — папка прямо в data_root (S02_animals1, S03_animals2, ...),
+        # внутри которой (возможно, через один лишний уровень обёртки) лежат
+        # low_light_10/low_light_20/normal_light_10/normal_light_20.
         all_seq_pairs = []
-        for scene_dir in sorted(input_root.iterdir()):
-            if not scene_dir.is_dir():
-                continue
-            for ll, nl in zip(self.LIGHT_LEVELS, self.GT_LEVELS):
-                low_dir = scene_dir / ll
-                gt_dir  = gt_root / scene_dir.name / nl
-                if low_dir.exists() and gt_dir.exists():
-                    all_seq_pairs.append((low_dir, gt_dir))
+        skipped_scenes = []
+        for root in data_roots:
+            for scene_dir in sorted(root.iterdir()):
+                if not scene_dir.is_dir():
+                    continue
+                content_dir = self._resolve_scene_content_dir(scene_dir)
+                found_any = False
+                for ll, nl in zip(self.LIGHT_LEVELS, self.GT_LEVELS):
+                    low_dir = content_dir / ll
+                    gt_dir  = content_dir / nl
+                    if low_dir.exists() and gt_dir.exists():
+                        # Сохраняем исходное имя сцены (scene_dir.name) явно — оно не
+                        # зависит от того, есть ли двойная вложенность, и используется
+                        # при построении поля имени в __getitem__.
+                        all_seq_pairs.append((low_dir, gt_dir, scene_dir.name))
+                        found_any = True
+                if not found_any:
+                    skipped_scenes.append(scene_dir.name)
+
+        if skipped_scenes:
+            print(
+                f"[BVIRLVDataset] Пропущены сцены без low_light_*/normal_light_* "
+                f"подпапок: {skipped_scenes}"
+            )
 
         if not all_seq_pairs:
-            raise RuntimeError(f"BVI-RLV: no sequences found in {data_root}")
+            raise RuntimeError(f"BVI-RLV: no sequences found in {data_roots}")
 
         # Детерминированный split
         rng = random.Random(seed)
@@ -195,7 +261,7 @@ class BVIRLVDataset(Dataset):
         # Строим сэмплы (скользящее окно)
         exts = {'.png', '.jpg', '.jpeg'}
         self.samples = []
-        for low_dir, gt_dir in sorted(selected):
+        for low_dir, gt_dir, scene_name in sorted(selected):
             low_frames = sorted([p for p in low_dir.iterdir() if p.suffix.lower() in exts])
             gt_frames  = sorted([p for p in gt_dir.iterdir()  if p.suffix.lower() in exts])
             n = min(len(low_frames), len(gt_frames))
@@ -204,7 +270,7 @@ class BVIRLVDataset(Dataset):
             for i in range(window_size - 1, n):
                 window_lq = [low_frames[i - window_size + 1 + j] for j in range(window_size)]
                 target_gt = gt_frames[i]
-                self.samples.append((window_lq, target_gt))
+                self.samples.append((window_lq, target_gt, scene_name))
 
         if not self.samples:
             raise RuntimeError(
@@ -236,7 +302,7 @@ class BVIRLVDataset(Dataset):
         return frames, target
 
     def __getitem__(self, idx):
-        lq_paths, gt_path = self.samples[idx]
+        lq_paths, gt_path, scene_name = self.samples[idx]
         frames = [load_image(str(p)) for p in lq_paths]
         target = load_image(str(gt_path))
 
@@ -254,14 +320,13 @@ class BVIRLVDataset(Dataset):
 
         frames_t   = torch.stack(frames, dim=0)
         timespans  = torch.full((self.window_size,), self.dt)
-        scene      = lq_paths[-1].parent.parent.name   # S01
         level      = lq_paths[-1].parent.name          # low_light_10
         frame_name = lq_paths[-1].stem                 # 00005
         return {
             'frames':    frames_t,
             'target':    target,
             'timespans': timespans,
-            'name':      f"{scene}/{level}/{frame_name}",
+            'name':      f"{scene_name}/{level}/{frame_name}",
         }
 
 
