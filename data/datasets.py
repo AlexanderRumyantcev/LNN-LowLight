@@ -35,6 +35,23 @@ def load_image(path: str) -> torch.Tensor:
     return TF.to_tensor(img)
 
 
+def load_image_npy(path: str) -> torch.Tensor:
+    """
+    Загрузить препроцессированный .npy кадр (uint8, HWC, [0, 255]) -> тензор [3, H, W] float в [0, 1].
+
+    Используется как быстрая замена load_image() для PNG-кадров, заранее
+    декодированных скриптом scripts/preprocess_png_to_npy.py. Нормализация /255.0
+    делается здесь, при загрузке каждого сэмпла — то же самое место, где это
+    делает TF.to_tensor() внутри load_image(). uint8 в 4 раза легче на диске, чем
+    float32, поэтому кэш всегда сохраняется в uint8, не float32 — это вопрос формата
+    хранения, не того, что видит модель — итоговый тензор побитово идентичен тому,
+    что вернул бы load_image() на исходном PNG.
+    """
+    arr = np.load(path)                            # (H, W, 3) uint8, [0, 255]
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    return t.float().div(255.0)
+
+
 class LOLDataset(Dataset):
     """
     LOL dataset для image enhancement (не видео).
@@ -198,6 +215,7 @@ class BVIRLVDataset(Dataset):
         fps: float = 30.0,
         train_ratio: float = 0.85,
         seed: int = 42,
+        npy_cache_root=None,
     ):
         """
         data_root: путь к папке с сценами (str) ЛИБО список таких путей (list[str]).
@@ -205,12 +223,19 @@ class BVIRLVDataset(Dataset):
         (например /kaggle/input/bvi-rlv-...-20-scene-subset и
         /kaggle/input/bvi-rlv-...-part-2) — оба источника объединяются в один пул
         сцен до train/test сплита, без каких-либо копирований/symlink на диске.
+
+        npy_cache_root: опциональный путь (str) к корневой директории с .npy-кешем,
+        созданным scripts/preprocess_png_to_npy.py. Через этот путь зеркалится та же
+        структура патчей, что и в data_root (SceneName/SceneName/low_light_10/...),
+        но с .npy вместо .png. Если None — используется исходный PNG-путь без изменений
+        поведения (обратная совместимость с кодом до этого изменения).
         """
         super().__init__()
         self.window_size = window_size
         self.patch_size  = patch_size
         self.augment     = augment and (split == 'train')
         self.dt          = 1.0 / fps
+        self.npy_cache_root = Path(npy_cache_root) if npy_cache_root is not None else None
 
         data_roots = [data_root] if isinstance(data_root, (str, Path)) else list(data_root)
         data_roots = [Path(r) for r in data_roots]
@@ -236,8 +261,9 @@ class BVIRLVDataset(Dataset):
                     if low_dir.exists() and gt_dir.exists():
                         # Сохраняем исходное имя сцены (scene_dir.name) явно — оно не
                         # зависит от того, есть ли двойная вложенность, и используется
-                        # при построении поля имени в __getitem__.
-                        all_seq_pairs.append((low_dir, gt_dir, scene_dir.name))
+                        # при построении поля имени в __getitem__. root сохраняем тоже —
+                        # нужен для построения npy-пути через relative_to() в _npy_path_for.
+                        all_seq_pairs.append((low_dir, gt_dir, scene_dir.name, root))
                         found_any = True
                 if not found_any:
                     skipped_scenes.append(scene_dir.name)
@@ -261,7 +287,7 @@ class BVIRLVDataset(Dataset):
         # Строим сэмплы (скользящее окно)
         exts = {'.png', '.jpg', '.jpeg'}
         self.samples = []
-        for low_dir, gt_dir, scene_name in sorted(selected):
+        for low_dir, gt_dir, scene_name, root in sorted(selected, key=lambda t: (str(t[0]), str(t[1]))):
             low_frames = sorted([p for p in low_dir.iterdir() if p.suffix.lower() in exts])
             gt_frames  = sorted([p for p in gt_dir.iterdir()  if p.suffix.lower() in exts])
             n = min(len(low_frames), len(gt_frames))
@@ -270,13 +296,28 @@ class BVIRLVDataset(Dataset):
             for i in range(window_size - 1, n):
                 window_lq = [low_frames[i - window_size + 1 + j] for j in range(window_size)]
                 target_gt = gt_frames[i]
-                self.samples.append((window_lq, target_gt, scene_name))
+                self.samples.append((window_lq, target_gt, scene_name, root))
 
         if not self.samples:
             raise RuntimeError(
                 f"BVIRLVDataset: no samples built (split={split}, "
                 f"sequences={len(selected)}, window={window_size})"
             )
+
+    def _npy_path_for(self, png_path: Path, scene_root: Path) -> Path:
+        """
+        По пути исходного PNG строит путь к зеркальному .npy внутри self.npy_cache_root.
+
+        scene_root — это data_root (один из нескольких в случае нескольких Kaggle-датасетов),
+        относительно которого построен этот png_path — сохраняется явно в self.samples для
+        каждого сэмпла, чтобы relative_to() работал корректно независимо от того,
+        была ли двойная вложенность SceneName/SceneName/ или нет.
+
+        Префикс .npy_cache зеркалит полную структуру от scene_root, включая имя сцены и
+        возможную вложенность — то же делает scripts/preprocess_png_to_npy.py.
+        """
+        rel = png_path.relative_to(scene_root)
+        return (self.npy_cache_root / rel).with_suffix('.npy')
 
     def __len__(self):
         return len(self.samples)
@@ -302,9 +343,14 @@ class BVIRLVDataset(Dataset):
         return frames, target
 
     def __getitem__(self, idx):
-        lq_paths, gt_path, scene_name = self.samples[idx]
-        frames = [load_image(str(p)) for p in lq_paths]
-        target = load_image(str(gt_path))
+        lq_paths, gt_path, scene_name, root = self.samples[idx]
+
+        if self.npy_cache_root is not None:
+            frames = [load_image_npy(str(self._npy_path_for(p, root))) for p in lq_paths]
+            target = load_image_npy(str(self._npy_path_for(gt_path, root)))
+        else:
+            frames = [load_image(str(p)) for p in lq_paths]
+            target = load_image(str(gt_path))
 
         if self.augment:
             frames, target = self._sync_crop(frames, target)
@@ -506,6 +552,9 @@ def build_dataset(cfg: dict, split: str):
             window_size=cfg.get('window_size', 5),
             patch_size=cfg.get('patch_size', 256),
             fps=cfg.get('fps', 30.0),
+            train_ratio=cfg.get('train_ratio', 0.85),
+            seed=cfg.get('seed', 42),
+            npy_cache_root=cfg.get('npy_cache_root'),
         )
     elif name == 'sdsd':
         return SDSDDataset(
