@@ -96,12 +96,18 @@ def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
     totals = {'total': 0., 'pixel': 0., 'ssim': 0., 'temporal': 0.}
     n = 0
+    # non_blocking=True имеет эффект только если тензор лежит в pinned memory
+    # (DataLoader создан с pin_memory=True) — иначе .to(..., non_blocking=True)
+    # тихо деградирует до обычного синхронного переноса, без предупреждения.
+    # Здесь это безопасно: train_loader строится с pin_memory=(device.type ==
+    # 'cuda') в main() — то есть non_blocking реально не блокирует CPU-поток
+    # только на CUDA; на CPU/MPS аргумент просто игнорируется PyTorch.
     for batch in loader:
-        frames    = batch['frames'].to(device)
-        target    = batch['target'].to(device)
+        frames    = batch['frames'].to(device, non_blocking=True)
+        target    = batch['target'].to(device, non_blocking=True)
         timespans = batch.get('timespans')
         if timespans is not None:
-            timespans = timespans.to(device)
+            timespans = timespans.to(device, non_blocking=True)
         pred   = model(frames, timespans)
         losses = criterion(pred, target)
         optimizer.zero_grad()
@@ -122,11 +128,11 @@ def validate(model, loader, criterion, device):
     model.eval()
     total_psnr, total_loss, n = 0., 0., 0
     for batch in loader:
-        frames    = batch['frames'].to(device)
-        target    = batch['target'].to(device)
+        frames    = batch['frames'].to(device, non_blocking=True)
+        target    = batch['target'].to(device, non_blocking=True)
         timespans = batch.get('timespans')
         if timespans is not None:
-            timespans = timespans.to(device)
+            timespans = timespans.to(device, non_blocking=True)
         pred   = model(frames, timespans).clamp(0., 1.)
         losses = criterion(pred, target)
         total_loss += losses['total'].item()
@@ -174,7 +180,10 @@ def main():
         train_ds, batch_size=tc['batch_size'], shuffle=True,
         num_workers=tc['num_workers'], pin_memory=(device.type == 'cuda'), drop_last=True,
     )
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+    val_loader = DataLoader(
+        val_ds, batch_size=1, shuffle=False, num_workers=0,
+        pin_memory=(device.type == 'cuda'),
+    )
     print(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples\n")
 
     # Loss / Optimizer / Scheduler
