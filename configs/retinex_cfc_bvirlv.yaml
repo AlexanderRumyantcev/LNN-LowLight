@@ -24,10 +24,21 @@ dataset:
   fps: 30.0
   train_ratio: 0.85
   seed: 42
+  # /kaggle/tmp/, НЕ /kaggle/working/ — working ограничен 20GiB и персистится
+  # как output ноутбука при Save Version/Commit; /kaggle/tmp даёт ~60GiB
+  # scratch space, которое НЕ персистится, так что не нужен отдельный
+  # cleanup-код перед завершением скрипта (см. mempalace LNN_LowLight/decisions,
+  # drawer про /kaggle/tmp, 2026-06-29). Кэш пересобирается с нуля при каждом
+  # новом Commit-запуске (~24 мин на весь датасет по ранним замерам) — это
+  # принятая стоимость, не bottleneck для diagnostic-прогонов.
+  npy_cache_root: /kaggle/tmp/bvi_rlv_npy
 
 train:
   batch_size: 4
-  num_workers: 2
+  # num_workers: 4 — синхронизировано с фиксом, ранее применённым вручную
+  # в Kaggle-сессии (см. mempalace), но не закоммиченным в этот конфиг.
+  # 2 воркеров было недостаточно для PNG/NPY decode bottleneck.
+  num_workers: 4
   epochs: 100
   lr: 0.0002
   lr_min: 0.000001
@@ -46,3 +57,13 @@ paths:
   checkpoints: /kaggle/working/experiments/checkpoints/cfc_bvirlv
   logs: /kaggle/working/experiments/logs/cfc_bvirlv
   results: /kaggle/working/experiments/results/cfc_bvirlv
+
+# Параметры для 2-3ч diagnostic-прогона (proof-of-concept, не полное
+# обучение) передаются через CLI, не через этот конфиг:
+#   python train.py --config configs/retinex_cfc_bvirlv.yaml \
+#       --wall-clock-limit-sec 9000 --checkpoint-every-sec 600
+# 9000с = 2.5ч, с запасом относительно лимита самой Kaggle-сессии (9-12ч) —
+# скрипт должен успеть сохранить финальный чекпоинт и завершиться сам,
+# не быть прерванным принудительно платформой на середине записи.
+# epochs=100 в конфиге OСТАЁТСЯ как есть (это лимит полного обучения,
+# не диагностики) — wall-clock остановит diagnostic-прогон раньше него.
