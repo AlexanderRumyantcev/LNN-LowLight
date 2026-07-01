@@ -296,6 +296,19 @@ def main():
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        # Восстанавливаем scheduler state если присутствует в чекпоинте.
+        # get() с fallback=None — backward-совместимость со старыми чекпоинтами
+        # (до этого коммита), которые scheduler state не сохраняли.
+        # Нюанс Фазы 2: если phase2_started=False и epoch==finetune_epoch,
+        # cosine_sched будет пересоздан при unfreeze ниже в цикле —
+        # восстановленный state будет перезаписан, что корректно (новый
+        # cosine_sched для Фазы 2 стартует с нуля). Если phase2_started=True,
+        # unfreeze не сработает и восстановленный cosine_sched.state_dict()
+        # останется действительным.
+        if ckpt.get('warmup_sched') is not None:
+            warmup_sched.load_state_dict(ckpt['warmup_sched'])
+        if ckpt.get('cosine_sched') is not None:
+            cosine_sched.load_state_dict(ckpt['cosine_sched'])
         # partial_epoch чекпоинты (сохранённые внутри train_epoch по таймеру
         # или по wall-clock останову) хранят epoch текущей, НЕЗАВЕРШЁННОЙ
         # эпохи. При resume с такого чекпоинта эпоха ПЕРЕЗАПУСКАЕТСЯ С НАЧАЛА
@@ -325,6 +338,13 @@ def main():
         state = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
+            # Оба scheduler state сохраняются всегда. В Фазе 1 активен
+            # warmup_sched (эпохи < warmup_epochs), потом cosine_sched.
+            # При unfreeze cosine_sched пересоздаётся с нуля — сохранённый
+            # здесь pre-unfreeze state будет проигнорирован при resume
+            # (перезаписан новым cosine_sched), что корректно.
+            'warmup_sched': warmup_sched.state_dict(),
+            'cosine_sched': cosine_sched.state_dict(),
             'best_psnr': best_psnr,
             'phase2_started': phase2_started,
             'config': cfg,
@@ -357,15 +377,15 @@ def main():
 
         t0 = time.time()
 
-        # checkpoint_fn — closure, захватывает model/optimizer/best_psnr/
-        # phase2_started/cfg из окружающего main() через save_checkpoint().
-        # Всегда пишет В ОДИН И ТОТ ЖЕ файл checkpoints/latest.pth
-        # (перезаписывается на каждый вызов), а не растущий список — иначе
-        # чекпоинты каждые checkpoint_every_sec секунд за 2-3ч diagnostic-
-        # прогона дали бы 12-18+ отдельных файлов и сами стали бы заметным
-        # вкладом в размер output ноутбука. best.pth и epoch_XXXX.pth (ниже)
-        # остаются отдельными именованными файлами, но сохраняются только
-        # для ПОЛНЫХ (не partial) эпох.
+        # checkpoint_fn — closure, захватывает model/optimizer/warmup_sched/
+        # cosine_sched/best_psnr/phase2_started/cfg из окружающего main()
+        # через save_checkpoint(). Всегда пишет В ОДИН И ТОТ ЖЕ файл
+        # checkpoints/latest.pth (перезаписывается на каждый вызов), а не
+        # растущий список — иначе чекпоинты каждые checkpoint_every_sec
+        # секунд за 2-3ч diagnostic-прогона дали бы 12-18+ отдельных файлов
+        # и сами стали бы заметным вкладом в размер output ноутбука.
+        # best.pth и epoch_XXXX.pth (ниже) остаются отдельными именованными
+        # файлами, но сохраняются только для ПОЛНЫХ (не partial) эпох.
         def checkpoint_fn(extra):
             save_checkpoint(
                 os.path.join(cfg['paths']['checkpoints'], 'latest.pth'),
