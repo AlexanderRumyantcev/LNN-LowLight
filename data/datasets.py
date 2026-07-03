@@ -52,6 +52,41 @@ def load_image_npy(path: str) -> torch.Tensor:
     return t.float().div(255.0)
 
 
+def load_image_with_npy_cache(png_path: Path, npy_path: Path) -> torch.Tensor:
+    """
+    Загрузить кадр с fallback: если .npy кэш существует — читать его (быстро),
+    иначе читать PNG и сохранить .npy на лету для следующих обращений.
+
+    Запись атомарна: сначала пишем во временный файл (.npy.tmp), потом
+    os.replace() — так параллельные DataLoader-воркеры, одновременно
+    попавшие на один и тот же кадр в первой эпохе, не увидят частично
+    записанный .npy (os.replace() атомарен на POSIX-системах в пределах
+    одной файловой системы, что верно для /kaggle/tmp).
+    """
+    if npy_path.exists():
+        return load_image_npy(str(npy_path))
+
+    # Fallback: читаем PNG, конвертируем в uint8 numpy, сохраняем .npy
+    tensor = load_image(str(png_path))             # [3, H, W] float [0, 1]
+    arr = (tensor.permute(1, 2, 0) * 255).byte().numpy()  # (H, W, 3) uint8
+
+    npy_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = npy_path.with_suffix('.npy.tmp')
+    try:
+        np.save(str(tmp_path), arr)
+        os.replace(str(tmp_path), str(npy_path))
+    except OSError:
+        # Не смогли записать кэш (нет места, нет прав) — молча продолжаем
+        # без кэширования. Следующее обращение снова прочитает PNG.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    return tensor
+
+
 class LOLDataset(Dataset):
     """
     LOL dataset для image enhancement (не видео).
@@ -167,6 +202,13 @@ class BVIRLVDataset(Dataset):
     подключены и -20-scene-subset, и -part-2 к одному ноутбуку) — все сцены со всех
     указанных каталогов объединяются в один пул до train/test сплита.
 
+    npy_cache_root (опционально): путь к корневой директории с .npy-кэшем.
+    Если задан — используется load_image_with_npy_cache():
+      - если .npy существует → читать его (2.11x быстрее PNG)
+      - если нет → читать PNG + сохранить .npy на лету для следующих обращений
+    Первая эпоха — смешанный PNG+запись режим, последующие — чистый npy.
+    Если None — всегда PNG (медленнее, но без предварительной подготовки).
+
     Возвращает:
       frames:    [T, 3, H, W]  — окно из T low-light кадров
       target:    [3, H, W]     — GT текущего кадра
@@ -224,11 +266,9 @@ class BVIRLVDataset(Dataset):
         /kaggle/input/bvi-rlv-...-part-2) — оба источника объединяются в один пул
         сцен до train/test сплита, без каких-либо копирований/symlink на диске.
 
-        npy_cache_root: опциональный путь (str) к корневой директории с .npy-кешем,
-        созданным scripts/preprocess_png_to_npy.py. Через этот путь зеркалится та же
-        структура патчей, что и в data_root (SceneName/SceneName/low_light_10/...),
-        но с .npy вместо .png. Если None — используется исходный PNG-путь без изменений
-        поведения (обратная совместимость с кодом до этого изменения).
+        npy_cache_root: опциональный путь (str) к корневой директории с .npy-кешем.
+        Если задан, используется load_image_with_npy_cache() — читает .npy если есть,
+        иначе читает PNG и сохраняет .npy на лету. Если None — всегда PNG.
         """
         super().__init__()
         self.window_size = window_size
@@ -244,9 +284,6 @@ class BVIRLVDataset(Dataset):
                 raise FileNotFoundError(f"BVI-RLV data_root not found: {r}")
 
         # Собираем все (сцена, уровень) пары со всех data_roots.
-        # Каждая сцена — папка прямо в data_root (S02_animals1, S03_animals2, ...),
-        # внутри которой (возможно, через один лишний уровень обёртки) лежат
-        # low_light_10/low_light_20/normal_light_10/normal_light_20.
         all_seq_pairs = []
         skipped_scenes = []
         for root in data_roots:
@@ -259,10 +296,6 @@ class BVIRLVDataset(Dataset):
                     low_dir = content_dir / ll
                     gt_dir  = content_dir / nl
                     if low_dir.exists() and gt_dir.exists():
-                        # Сохраняем исходное имя сцены (scene_dir.name) явно — оно не
-                        # зависит от того, есть ли двойная вложенность, и используется
-                        # при построении поля имени в __getitem__. root сохраняем тоже —
-                        # нужен для построения npy-пути через relative_to() в _npy_path_for.
                         all_seq_pairs.append((low_dir, gt_dir, scene_dir.name, root))
                         found_any = True
                 if not found_any:
@@ -312,9 +345,6 @@ class BVIRLVDataset(Dataset):
         относительно которого построен этот png_path — сохраняется явно в self.samples для
         каждого сэмпла, чтобы relative_to() работал корректно независимо от того,
         была ли двойная вложенность SceneName/SceneName/ или нет.
-
-        Префикс .npy_cache зеркалит полную структуру от scene_root, включая имя сцены и
-        возможную вложенность — то же делает scripts/preprocess_png_to_npy.py.
         """
         rel = png_path.relative_to(scene_root)
         return (self.npy_cache_root / rel).with_suffix('.npy')
@@ -346,8 +376,16 @@ class BVIRLVDataset(Dataset):
         lq_paths, gt_path, scene_name, root = self.samples[idx]
 
         if self.npy_cache_root is not None:
-            frames = [load_image_npy(str(self._npy_path_for(p, root))) for p in lq_paths]
-            target = load_image_npy(str(self._npy_path_for(gt_path, root)))
+            # load_image_with_npy_cache: читает .npy если есть, иначе читает PNG
+            # и сохраняет .npy на лету. Первая эпоха — смешанный режим (PNG +
+            # запись кэша), последующие — чистый npy (полная скорость 2.11x).
+            frames = [
+                load_image_with_npy_cache(p, self._npy_path_for(p, root))
+                for p in lq_paths
+            ]
+            target = load_image_with_npy_cache(
+                gt_path, self._npy_path_for(gt_path, root)
+            )
         else:
             frames = [load_image(str(p)) for p in lq_paths]
             target = load_image(str(gt_path))
@@ -397,7 +435,7 @@ class SDSDDataset(Dataset):
 
     Возвращает:
       frames:    [T, 3, H, W]  — окно из T low-light кадров
-      target:    [3, H, W]     — GT текущего (последнего) кадра
+      target:    [3, H, W]     — GT текущего кадра
       timespans: [T]           — ∆t между кадрами (1/fps)
       name:      str           — "pairN/XXXXX"
     """
