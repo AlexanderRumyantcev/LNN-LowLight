@@ -24,20 +24,15 @@ dataset:
   fps: 30.0
   train_ratio: 0.85
   seed: 42
-  # /kaggle/tmp/, НЕ /kaggle/working/ — working ограничен 20GiB и персистится
-  # как output ноутбука при Save Version/Commit; /kaggle/tmp даёт ~60GiB
-  # scratch space, которое НЕ персистится, так что не нужен отдельный
-  # cleanup-код перед завершением скрипта (см. mempalace LNN_LowLight/decisions,
-  # drawer про /kaggle/tmp, 2026-06-29). Кэш пересобирается с нуля при каждом
-  # новом Commit-запуске (~24 мин на весь датасет по ранним замерам) — это
-  # принятая стоимость, не bottleneck для diagnostic-прогонов.
-  npy_cache_root: /kaggle/tmp/bvi_rlv_npy
+  # npy_cache_root убран: /kaggle/tmp на практике выделяет меньше ~60GiB
+  # (рекламируемых) — при попытке кэшировать весь датасет (~32420 PNG файлов)
+  # место заканчивается примерно на 6500/32420 файлов (ошибка "tried to use
+  # more disk space than is available", Kaggle Commit Version 2, 2026-07-03).
+  # Для diagnostic-прогона используем PNG напрямую: ~0.65 с/батч (~2 полные
+  # эпохи за 2.5ч wall-clock) — достаточно для оценки тренда train/total loss.
 
 train:
   batch_size: 4
-  # num_workers: 4 — синхронизировано с фиксом, ранее применённым вручную
-  # в Kaggle-сессии (см. mempalace), но не закоммиченным в этот конфиг.
-  # 2 воркеров было недостаточно для PNG/NPY decode bottleneck.
   num_workers: 4
   epochs: 100
   lr: 0.0002
@@ -45,7 +40,6 @@ train:
   warmup_epochs: 5
   save_every: 10
   val_every: 5
-  # Фаза 2 (fine-tune backbone): unfreeze после epoch 50, lr * backbone_lr_scale
   finetune_epoch: 50
 
 loss:
@@ -58,12 +52,6 @@ paths:
   logs: /kaggle/working/experiments/logs/cfc_bvirlv
   results: /kaggle/working/experiments/results/cfc_bvirlv
 
-# Параметры для 2-3ч diagnostic-прогона (proof-of-concept, не полное
-# обучение) передаются через CLI, не через этот конфиг:
+# Параметры для diagnostic-прогона передаются через CLI:
 #   python train.py --config configs/retinex_cfc_bvirlv.yaml \
 #       --wall-clock-limit-sec 9000 --checkpoint-every-sec 600
-# 9000с = 2.5ч, с запасом относительно лимита самой Kaggle-сессии (9-12ч) —
-# скрипт должен успеть сохранить финальный чекпоинт и завершиться сам,
-# не быть прерванным принудительно платформой на середине записи.
-# epochs=100 в конфиге OСТАЁТСЯ как есть (это лимит полного обучения,
-# не диагностики) — wall-clock остановит diagnostic-прогон раньше него.
