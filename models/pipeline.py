@@ -94,27 +94,54 @@ class RetinexLNNPipeline(nn.Module):
         self,
         frames: torch.Tensor,
         timespans: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_prev: bool = False,
+    ):
         """
         Args:
-            frames:    [B, T, 3, H, W] — окно из T кадров.
-                       Последний кадр (T-1) — текущий, остальные — контекст.
-            timespans: [B, T] — ∆t между кадрами. Если None — используется 1/fps.
+            frames:      [B, T, 3, H, W] — окно из T кадров.
+                         Последний кадр (T-1) — текущий, остальные — контекст.
+            timespans:   [B, T] — ∆t между кадрами. Если None — используется 1/fps.
+            return_prev: если True — дополнительно вернуть enhanced-выход для
+                         предпоследнего (T-2) кадра окна. Нужен для
+                         TemporalConsistencyLoss (losses/combined_loss.py),
+                         который без него всегда получает temporal=0.0.
+                         Вычисляется почти бесплатно: illu_fea/illu_map для
+                         шага T-2 уже посчитаны temporal-модулем и estimator'ом
+                         ниже — единственная доп. работа — второй проход
+                         denoiser'а. Не включён по умолчанию, чтобы не менять
+                         поведение существующих вызовов (eval.py, inference.py,
+                         smoke_test.py), которые ожидают один тензор на выходе.
         Returns:
-            enhanced:  [B, 3, H, W] — enhanced текущий кадр
+            Если return_prev=False (по умолчанию):
+                enhanced: [B, 3, H, W] — enhanced текущий кадр
+            Если return_prev=True:
+                (enhanced, enhanced_prev): enhanced_prev — [B, 3, H, W] или
+                None, если T < 2 (нет предыдущего кадра в окне) или
+                temporal_type='none' (per-frame baseline не даёт prev —
+                для него temporal loss не применим по построению).
         """
         B, T, C, H, W = frames.shape
         current = frames[:, -1]  # [B, 3, H, W]
 
+        illu_fea_prev = None
+        illu_map_prev = None
+
         if self.temporal is None:
-            # Baseline: per-frame, без темпорального контекста
+            # Baseline: per-frame, без темпорального контекста.
+            # У baseline нет понятия "предыдущий enhanced через temporal
+            # модуль" — temporal loss для него не применим по построению,
+            # поэтому enhanced_prev всегда None независимо от return_prev.
             illu_fea, illu_map = self.estimator(current)
         else:
-            # Прогнать все кадры через estimator
+            # Прогнать все кадры через estimator. illu_maps[t] раньше
+            # вычислялся, но выбрасывался (кроме t=T-1, для которого потом
+            # оценивался ПОВТОРНО ниже) — теперь сохраняем всё за один проход.
             illu_feas = []
+            illu_maps = []
             for t in range(T):
-                fea, _ = self.estimator(frames[:, t])
+                fea, imap = self.estimator(frames[:, t])
                 illu_feas.append(fea)
+                illu_maps.append(imap)
 
             illu_fea_seq = torch.stack(illu_feas, dim=1)  # [B, T, C, H, W]
 
@@ -125,17 +152,28 @@ class RetinexLNNPipeline(nn.Module):
                     device=frames.device, dtype=frames.dtype,
                 )
 
-            # Темпоральный модуль обновляет illu_fea текущего кадра
-            illu_fea = self.temporal(illu_fea_seq, timespans)
+            # Темпоральный модуль возвращает (illu_fea для T-1, illu_fea для
+            # T-2 или None) — раньше отдавался только первый элемент.
+            illu_fea, illu_fea_prev = self.temporal(illu_fea_seq, timespans)
 
-            # illu_map берём от текущего кадра (для input_img)
-            _, illu_map = self.estimator(current)
+            illu_map = illu_maps[-1]
+            if T >= 2:
+                illu_map_prev = illu_maps[-2]
 
-        # Стандартный Retinex forward: enhance + denoise
+        # Стандартный Retinex forward: enhance + denoise (текущий кадр)
         input_img = current * illu_map + current
         output_img = self.denoiser(input_img, illu_fea)
 
-        return output_img
+        if not return_prev:
+            return output_img
+
+        enhanced_prev = None
+        if illu_fea_prev is not None and illu_map_prev is not None:
+            prev_frame = frames[:, -2]
+            input_img_prev = prev_frame * illu_map_prev + prev_frame
+            enhanced_prev = self.denoiser(input_img_prev, illu_fea_prev)
+
+        return output_img, enhanced_prev
 
     # ──────────────────────────────────────────────
     # Backbone freeze / unfreeze

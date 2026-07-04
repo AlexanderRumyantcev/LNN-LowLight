@@ -62,7 +62,14 @@ class CfCTemporalModule(nn.Module):
     Темпоральный модуль на основе CfC для моделирования динамики освещения.
 
     Принимает последовательность illumination features из N кадров,
-    возвращает обновлённую feature для текущего кадра.
+    возвращает обновлённую feature для текущего кадра И (опционально)
+    для предпоследнего кадра окна — нужно для temporal consistency loss
+    (см. losses/combined_loss.py TemporalConsistencyLoss).
+
+    Важно: рекуррентность строго causal (шаг t видит только входы 0..t),
+    поэтому "выход для T-2" — это ровно то же самое, что дал бы forward
+    на окне длины T-1, заканчивающемся кадром T-2. Никакой утечки будущего
+    контекста нет.
 
     Args:
         in_channels:  число каналов входного illu_fea (из RetinexFormer estimator)
@@ -101,11 +108,25 @@ class CfCTemporalModule(nn.Module):
             nn.Sigmoid(),
         )
 
+    def _finalize(self, out_vec: torch.Tensor, raw_fea: torch.Tensor) -> torch.Tensor:
+        """
+        Broadcast + residual-gate merge для ОДНОГО временного шага.
+        Вынесено в отдельный метод, чтобы применять одинаково и к
+        текущему (T-1), и к предпоследнему (T-2) шагу — раньше этот
+        код был инлайн и запускался только для последнего шага, из-за
+        чего выход для T-2 (уже посчитанный в out_seq) был недоступен
+        снаружи модуля и temporal loss всегда получал 0.0.
+        """
+        temporal_fea = self.broadcast(out_vec, raw_fea)
+        gate_input = torch.cat([raw_fea, temporal_fea], dim=1)
+        alpha = self.gate(gate_input)
+        return alpha * temporal_fea + (1 - alpha) * raw_fea
+
     def forward(
         self,
         illu_fea_seq: torch.Tensor,
         timespans: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             illu_fea_seq: [B, T, C, H, W] — последовательность illumination features
@@ -113,7 +134,10 @@ class CfCTemporalModule(nn.Module):
             timespans:    [B, T] — временные интервалы между кадрами (∆t = 1/fps).
                           Если None — используется равномерный ∆t=1.
         Returns:
-            illu_fea_enhanced: [B, C, H, W] — enhanced illumination для текущего кадра
+            (illu_fea_curr, illu_fea_prev):
+                illu_fea_curr: [B, C, H, W] — enhanced illumination для текущего (T-1) кадра
+                illu_fea_prev: [B, C, H, W] или None — то же для предпоследнего (T-2)
+                    кадра, None если T < 2 (нет "предыдущего" кадра в окне)
         """
         B, T, C, H, W = illu_fea_seq.shape
 
@@ -143,16 +167,13 @@ class CfCTemporalModule(nn.Module):
             output_sequence.append(self.cfc.fc(h_out))   # [B, hidden_dim]
         out_seq = torch.stack(output_sequence, dim=1)     # [B, T, hidden_dim]
 
-        # Берём выход для последнего (текущего) кадра
-        out_vec = out_seq[:, -1, :]  # [B, hidden_dim]
+        # out_seq уже содержит выходы ДЛЯ ВСЕХ шагов 0..T-1 (это цена
+        # пошагового forward выше) — раньше отсюда брался только
+        # out_seq[:, -1, :], а шаг T-2 отбрасывался.
+        illu_fea_curr = self._finalize(out_seq[:, -1, :], illu_fea_seq[:, -1])
+        illu_fea_prev = (
+            self._finalize(out_seq[:, -2, :], illu_fea_seq[:, -2])
+            if T >= 2 else None
+        )
 
-        # Развернуть обратно в spatial
-        temporal_fea = self.broadcast(out_vec, illu_fea_seq[:, -1])  # [B, C, H, W]
-
-        # Residual gate: смешиваем оригинал и темпоральный контекст
-        current_fea = illu_fea_seq[:, -1]  # [B, C, H, W]
-        gate_input = torch.cat([current_fea, temporal_fea], dim=1)
-        alpha = self.gate(gate_input)  # [B, C, H, W] in [0,1]
-        out = alpha * temporal_fea + (1 - alpha) * current_fea
-
-        return out
+        return illu_fea_curr, illu_fea_prev

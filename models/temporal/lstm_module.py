@@ -34,7 +34,9 @@ class SpatialBroadcast(nn.Module):
 class LSTMTemporalModule(nn.Module):
     """
     LSTM temporal module — прямой baseline для сравнения с CfC.
-    Интерфейс идентичен CfCTemporalModule.
+    Интерфейс идентичен CfCTemporalModule: forward() возвращает
+    (illu_fea_curr, illu_fea_prev_or_None) — см. cfc_module.py про то,
+    зачем нужен prev.
     """
 
     def __init__(
@@ -63,21 +65,30 @@ class LSTMTemporalModule(nn.Module):
             nn.Sigmoid(),
         )
 
+    def _finalize(self, out_vec, raw_fea):
+        """Broadcast + residual-gate merge для одного временного шага."""
+        temporal_fea = self.broadcast(out_vec, raw_fea)
+        alpha = self.gate(torch.cat([raw_fea, temporal_fea], dim=1))
+        return alpha * temporal_fea + (1 - alpha) * raw_fea
+
     def forward(self, illu_fea_seq, timespans=None):
         """
         illu_fea_seq: [B, T, C, H, W]
         timespans: ignored (LSTM не использует непрерывное время)
-        → [B, C, H, W]
+        → (illu_fea_curr [B, C, H, W], illu_fea_prev [B, C, H, W] или None)
         """
         B, T, C, H, W = illu_fea_seq.shape
 
         vecs = [self.pooling(illu_fea_seq[:, t]) for t in range(T)]
         seq = torch.stack(vecs, dim=1)  # [B, T, hidden_dim]
 
+        # nn.LSTM уже считает выходы для ВСЕХ шагов в lstm_out — раньше
+        # использовался только lstm_out[:, -1], шаг T-2 отбрасывался.
         lstm_out, _ = self.lstm(seq)
-        out_vec = self.out_proj(lstm_out[:, -1])  # [B, hidden_dim]
 
-        temporal_fea = self.broadcast(out_vec, illu_fea_seq[:, -1])
-        current_fea = illu_fea_seq[:, -1]
-        alpha = self.gate(torch.cat([current_fea, temporal_fea], dim=1))
-        return alpha * temporal_fea + (1 - alpha) * current_fea
+        out_curr = self._finalize(self.out_proj(lstm_out[:, -1]), illu_fea_seq[:, -1])
+        out_prev = (
+            self._finalize(self.out_proj(lstm_out[:, -2]), illu_fea_seq[:, -2])
+            if T >= 2 else None
+        )
+        return out_curr, out_prev

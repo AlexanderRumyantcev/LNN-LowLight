@@ -137,8 +137,29 @@ def train_epoch(
         timespans = batch.get('timespans')
         if timespans is not None:
             timespans = timespans.to(device, non_blocking=True)
-        pred   = model(frames, timespans)
-        losses = criterion(pred, target)
+
+        # return_prev=True запрашивает у модели enhanced-выход для
+        # предпоследнего (T-2) кадра окна — без него CombinedLoss никогда
+        # не получает enhanced_prev/low_prev/low_curr и temporal loss
+        # всегда молча равен 0.0 (баг, зафиксированный в mempalace
+        # 2026-07-04, diagnostic run lnn-lowlight-cfc-bvirlv-train v4).
+        # Стоимость почти нулевая: illu_fea/illu_map для T-2 уже вычислены
+        # внутри forward(), добавляется только второй проход denoiser'а.
+        # При window_size=1 (T<2) prev физически недоступен — criterion сам
+        # корректно откатывается на temporal=0.0 в этом случае (валидное
+        # поведение, а не баг).
+        window_len = frames.shape[1]
+        if window_len >= 2:
+            pred, enhanced_prev = model(frames, timespans, return_prev=True)
+            low_prev, low_curr = frames[:, -2], frames[:, -1]
+        else:
+            pred = model(frames, timespans)
+            enhanced_prev = low_prev = low_curr = None
+
+        losses = criterion(
+            pred, target,
+            enhanced_prev=enhanced_prev, low_prev=low_prev, low_curr=low_curr,
+        )
         optimizer.zero_grad()
         losses['total'].backward()
         nn.utils.clip_grad_norm_(
