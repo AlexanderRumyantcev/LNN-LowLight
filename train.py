@@ -68,6 +68,60 @@ def build_model(cfg: dict) -> RetinexLNNPipeline:
     return model
 
 
+def load_backbone_from_checkpoint(model: RetinexLNNPipeline, ckpt_path: str, device) -> None:
+    """
+    Загружает ТОЛЬКО веса backbone (estimator + denoiser) из чекпоинта
+    ДРУГОГО прогона — для backbone init parity между сравниваемыми
+    temporal-модулями (см. ТЗ.md, раздел 11.3-11.4). Веса temporal-модуля
+    в чекпоинте-источнике игнорируются: они принадлежат другой архитектуре
+    (например, CfC) и несовместимы по форме тензоров с текущей моделью
+    (например, Transformer).
+
+    Имеет смысл использовать только при freeze_backbone=True и на ЧИСТОМ
+    старте (без --resume) — backbone в чекпоинте-источнике не обучался
+    (заморожен), поэтому его веса равны исходной случайной инициализации
+    того прогона; переиспользование этой инициализации устраняет random
+    seed backbone как источник неучтённого шума при сравнении temporal-
+    модулей между собой. Это НЕ экономия вычислений (backbone и так не
+    обучался) — это требование методологической валидности сравнения.
+
+    Args:
+        model:     модель, в которую загружаются веса (уже на нужном device)
+        ckpt_path: путь к чекпоинту-источнику (например, .../cfc_bvirlv/latest.pth)
+        device:    device для map_location при загрузке чекпоинта
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    src_state = ckpt['model']
+
+    backbone_state = {
+        k: v for k, v in src_state.items()
+        if k.startswith('estimator.') or k.startswith('denoiser.')
+    }
+    if not backbone_state:
+        raise ValueError(
+            f"В чекпоинте {ckpt_path} не найдено ключей estimator.*/denoiser.* — "
+            f"возможно, это чекпоинт от несовместимой версии модели."
+        )
+
+    # strict=False: missing_keys будет содержать все temporal.* ключи текущей
+    # модели — это ОЖИДАЕМО (загружаем только backbone), не ошибка.
+    # Несовпадение ФОРМ тензоров (например, другой n_feat в конфиге) вызовет
+    # RuntimeError напрямую из load_state_dict — оборачиваем в более понятное
+    # сообщение.
+    try:
+        model.load_state_dict(backbone_state, strict=False)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Не удалось загрузить backbone из {ckpt_path} — вероятно, "
+            f"n_feat/num_blocks в текущем конфиге не совпадают с исходным "
+            f"прогоном. Исходная ошибка: {e}"
+        ) from e
+
+    print(f"Backbone (estimator+denoiser) загружен из {ckpt_path} "
+          f"({len(backbone_state)} тензоров) — общая инициализация для "
+          f"честного сравнения temporal-модулей (ТЗ.md, п.11.4)")
+
+
 def build_optimizer(model: RetinexLNNPipeline, cfg: dict):
     tc = cfg['train']
     mc = cfg['model']
@@ -237,6 +291,16 @@ def main():
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument(
+        '--init-backbone-from', type=str, default=None,
+        help='Путь к чекпоинту ДРУГОГО прогона (например, CfC), из которого '
+             'загружаются ТОЛЬКО веса backbone (estimator+denoiser) — для '
+             'backbone init parity между сравниваемыми temporal-модулями '
+             '(ТЗ.md, п.11.3-11.4). Имеет смысл только при '
+             'freeze_backbone=True и чистом старте (без --resume — resume '
+             'и так восстанавливает полное состояние, включая backbone). '
+             'Веса temporal-модуля из чекпоинта-источника игнорируются.'
+    )
+    parser.add_argument(
         '--wall-clock-limit-sec', type=float, default=None,
         help='Жёсткий лимит по времени (секунды от старта main()) — при '
              'достижении train_epoch прерывается контролируемо ПОСЛЕ '
@@ -283,6 +347,14 @@ def main():
     params = model.get_num_params()
     print(f"Params: total={params['total']:,} | trainable={params['trainable']:,} "
           f"| temporal={params['temporal']:,}")
+
+    if args.init_backbone_from:
+        if args.resume:
+            print(f"ПРЕДУПРЕЖДЕНИЕ: --init-backbone-from игнорируется, т.к. "
+                  f"--resume уже восстанавливает полное состояние модели "
+                  f"(включая backbone) из {args.resume}")
+        else:
+            load_backbone_from_checkpoint(model, args.init_backbone_from, device)
 
     # Данные
     train_ds = build_dataset(cfg['dataset'], split='train')
