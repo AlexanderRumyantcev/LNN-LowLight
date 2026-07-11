@@ -1,0 +1,67 @@
+name: retinex_transformer_bvirlv
+temporal_type: transformer
+
+model:
+  n_feat: 32
+  stage: 1
+  num_blocks: [1, 1, 1]
+  window_size: 5
+  hidden_dim: 64      # не используется TransformerTemporalModule напрямую
+  n_neurons: 32        # (оставлено для единообразия с CfC-конфигом)
+  fps: 30.0
+  freeze_backbone: true      # trainable: backbone заморожен, обучается только temporal (~28k)
+  backbone_lr_scale: 0.1     # lr backbone при unfreeze = lr * 0.1
+  # d_model/n_heads/ff_ratio НЕ параметризуются отсюда — build_model() их не
+  # прокидывает, TransformerTemporalModule использует дефолты (52/2/2),
+  # подобранные под равный с CfC бюджет параметров (ТЗ.md п.11.3).
+
+dataset:
+  name: bvi_rlv
+  # Оба Kaggle-датасета подключены к ноутбуку одновременно (Add Input).
+  # BVIRLVDataset объединяет сцены из обоих путей в один пул до train/test сплита.
+  data_root:
+    - /kaggle/input/bvi-rlv-low-light-video-dataset-20-scene-subset
+    - /kaggle/input/bvi-rlv-low-light-video-dataset-part-2
+  patch_size: 256
+  window_size: 5
+  fps: 30.0
+  train_ratio: 0.85
+  seed: 42
+  # npy_cache_root не используется — см. комментарий в retinex_cfc_bvirlv.yaml
+  # (тот же вывод для BVI-RLV на Kaggle: /kaggle/tmp недостаточно для полного
+  # кэша, используем PNG напрямую).
+
+train:
+  batch_size: 4
+  num_workers: 4
+  epochs: 100
+  lr: 0.0002
+  lr_min: 0.000001
+  warmup_epochs: 5
+  save_every: 10
+  val_every: 5
+  finetune_epoch: 50
+
+loss:
+  lambda_pixel: 1.0
+  lambda_ssim: 0.1
+  lambda_temporal: 0.05
+
+paths:
+  checkpoints: /kaggle/working/experiments/checkpoints/transformer_bvirlv
+  logs: /kaggle/working/experiments/logs/transformer_bvirlv
+  results: /kaggle/working/experiments/results/transformer_bvirlv
+
+# Для честного сравнения с CfC-прогоном backbone должен стартовать с ТОЙ ЖЕ
+# случайной инициализации (ТЗ.md п.11.4) — используйте --init-backbone-from,
+# указав на latest.pth уже выполненного CfC-прогона (freeze_backbone=true в
+# обоих конфигах, поэтому backbone там не обучался и остаётся исходной
+# инициализацией):
+#
+#   python train.py --config configs/retinex_transformer_bvirlv.yaml \
+#       --init-backbone-from /kaggle/working/experiments/checkpoints/cfc_bvirlv/latest.pth \
+#       --wall-clock-limit-sec 9000 --checkpoint-every-sec 600
+#
+# Без --init-backbone-from backbone получит свою СЛУЧАЙНУЮ инициализацию
+# (другую, чем у CfC-прогона) — сравнение temporal-модулей будет смешано с
+# шумом от разной инициализации backbone.
