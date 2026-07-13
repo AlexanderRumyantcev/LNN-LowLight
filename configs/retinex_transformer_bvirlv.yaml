@@ -8,7 +8,13 @@ model:
   window_size: 5
   hidden_dim: 64      # не используется TransformerTemporalModule напрямую
   n_neurons: 32        # (оставлено для единообразия с CfC-конфигом)
-  fps: 30.0
+  # fps=25.0 — реальный frame rate BVI-RLV (25 fps, fixed shutter 1/50,
+  # см. arXiv:2407.03535); раньше стояло 30.0. Transformer/LSTM/GRU не
+  # завязаны на физическое время (в отличие от CfC), так что для них это
+  # чисто косметическая правка — оставлено для консистентности между
+  # конфигами (сравнение temporal-модулей должно идти на одном датасете
+  # с одинаковыми настройками, ТЗ.md п.11.4).
+  fps: 25.0
   freeze_backbone: true      # trainable: backbone заморожен, обучается только temporal (~28k)
   backbone_lr_scale: 0.1     # lr backbone при unfreeze = lr * 0.1
   # d_model/n_heads/ff_ratio НЕ параметризуются отсюда — build_model() их не
@@ -24,7 +30,7 @@ dataset:
     - /kaggle/input/bvi-rlv-low-light-video-dataset-part-2
   patch_size: 256
   window_size: 5
-  fps: 30.0
+  fps: 25.0   # см. комментарий в model.fps выше — реальный fps BVI-RLV
   train_ratio: 0.85
   seed: 42
   # npy_cache_root не используется — см. комментарий в retinex_cfc_bvirlv.yaml
