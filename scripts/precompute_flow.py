@@ -180,16 +180,36 @@ def collect_clips(data_roots: list[Path], scene_filter: str = None):
 # процедура провалидирована при закрытии Блокера 2).
 # ----------------------------------------------------------------------------
 def load_raft_small(raft_repo: Path, weights_path: Path, device: str):
+    """
+    ВАЖНО про импорт: модули внутри core/ (raft.py, update.py, extractor.py,
+    corr.py, utils/) в оригинальном репозитории princeton-vl/RAFT используют
+    ПЛОСКИЕ импорты друг друга (raft.py делает `from update import ...`,
+    `from extractor import ...`), а не пакетные `core.update`/`core.extractor`.
+    Официальный demo.py репозитория поэтому добавляет в sys.path именно папку
+    core/, а не корень репо, и импортирует `from raft import RAFT` (НЕ
+    `from core.raft import RAFT`). Если добавить в sys.path корень репозитория
+    и импортировать через `core.raft`, сам класс RAFT импортируется, но при
+    первой же попытке ОН импортировать `update`/`extractor` падает с
+    ModuleNotFoundError — это воспроизведённая на практике ошибка (не
+    гипотетическая), поэтому здесь намеренно добавляется raft_repo/'core'.
+    """
     raft_repo = Path(raft_repo)
-    if str(raft_repo) not in sys.path:
-        sys.path.insert(0, str(raft_repo))
+    core_dir = raft_repo / 'core'
+    if not core_dir.is_dir():
+        raise FileNotFoundError(
+            f"Ожидалась папка core/ внутри {raft_repo} — проверь, что это "
+            f"корень склонированного репозитория princeton-vl/RAFT, а не сам core/."
+        )
+    if str(core_dir) not in sys.path:
+        sys.path.insert(0, str(core_dir))
     try:
-        from core.raft import RAFT  # noqa: E402  (импорт после sys.path.insert — намеренно)
+        from raft import RAFT  # noqa: E402  (импорт после sys.path.insert — намеренно)
     except ImportError as e:
         raise ImportError(
-            f"Не удалось импортировать core.raft.RAFT из {raft_repo}. "
-            f"Проверь, что репозиторий princeton-vl/RAFT склонирован по этому "
-            f"пути и содержит папку core/. Оригинальная ошибка: {e}"
+            f"Не удалось импортировать RAFT из {core_dir}. "
+            f"Проверь, что репозиторий princeton-vl/RAFT склонирован полностью "
+            f"(core/raft.py, core/update.py, core/extractor.py, core/corr.py, "
+            f"core/utils/ должны присутствовать). Оригинальная ошибка: {e}"
         )
 
     args = argparse.Namespace(small=True, mixed_precision=False, alternate_corr=False)
