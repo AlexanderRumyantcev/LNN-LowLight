@@ -482,10 +482,20 @@ def upload_scene_dataset(zip_path: Path, scene_name: str, dataset_prefix: str, k
     staged_zip = upload_dir / zip_path.name
     shutil.copy2(zip_path, staged_zip)
 
+    # Kaggle требует title строго 6-50 символов — предыдущая версия с полным
+    # описанием (scene+resolution+source) уходила за 50 на длинных именах
+    # сцен (напоролись на S02_animals1 -> 74 символа). Короткий title,
+    # подробности переносим в description (там лимита нет).
+    title = f"BVI-RLV flow {scene_name}"
+    if len(title) > 50:
+        title = title[:50]
     metadata = {
-        "title": f"BVI-RLV flow cache ({scene_name}, half-res, RAFT-small on normal_light)",
+        "title": title,
         "id": f"{kaggle_username}/{slug}",
         "licenses": [{"name": "CC0-1.0"}],
+        "description": f"Optical flow cache (half-res, RAFT-small run on normal_light frames, "
+                        f"aligned to low_light_10/low_light_20) for scene {scene_name}, "
+                        f"BVI-RLV. Intermediate working data for LNN_LowLight motion alignment.",
     }
     (upload_dir / "dataset-metadata.json").write_text(json.dumps(metadata, indent=2))
 
