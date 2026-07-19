@@ -19,10 +19,14 @@
     подтверждено диагностикой Блокера 1 (2026-07-18), считать бюджет на
     целевом диске ПЕРЕД полным прогоном (известная проблема Kaggle:
     переполнение /kaggle/working при одновременном хранении PNG+NPY+blob+flow).
-  - Flow считается ТОЛЬКО между соседними кадрами внутри одного low_light
-    уровня одного клипа (i -> i+1), НЕ для normal_light (GT не идёт через
-    temporal-окно, только как supervision target — см. BVIRLVDataset.__getitem__
-    в data/datasets.py) и НЕ между разными levels/сценами.
+  - Flow считается на normal_light_XX той же сцены/уровня (НЕ на low_light!) —
+    см. ВАЖНО в докстринге collect_clips ниже: RAFT-small систематически даёт
+    мусорный flow на low_light кадрах (эмпирически подтверждено 2026-07-19),
+    низкоосвещённые и нормально-освещённые уровни синхронизированы по кадрам,
+    поэтому flow с normal_light переиспользуется для выравнивания low_light.
+    Результат сохраняется под путём low_light_XX (это цель выравнивания),
+    источник данных (normal_light_XX) виден только внутри process_clip.
+    Между разными levels/сценами flow не считается.
   - Загрузка RAFT-small: torch.hub недоступен на Kaggle (несовместим с версией
     torch) — модель через core.raft.RAFT (репозиторий princeton-vl/RAFT,
     склонированный отдельно), обёрнута в nn.DataParallel (веса сохранены с этим
@@ -96,12 +100,18 @@
 на 1-2 тестовых клипах; сам рендеринг вынесен за рамки этого скрипта):
   1. Загрузить сохранённый flow: `flow = torch.load(path).float()`  # [2, Hr, Wr]
   2. На статичном участке кадра (неподвижный фон) flow должен быть near-zero
-     по обеим компонентам (dx, dy) — как в тесте img1-vs-img1 при закрытии
-     Блокера 2 (mean=0.053).
+     по обеим компонентам (dx, dy).
   3. На движущемся объекте — связная, плавно меняющаяся область ненулевых
-     значений (не шум, не отдельные "выбросы" пикселей) — как в подтверждённом
-     тесте на соседних кадрах 0001/0002 (mean=0.37).
-  4. Цветовое кодирование (опционально, для быстрой визуальной оценки):
+     значений (не шум, не отдельные "выбросы" пикселей).
+  4. Ориентир по величине (эмпирически подтверждён 2026-07-19 картированием
+     ПО ВСЕМУ клипу S02/normal_light_10, а не по 1-2 точкам): mean|flow| по
+     клипу должен быть в районе ~1-2px, доля пар с mean|flow|>10px — около 0%.
+     (На low_light эти же метрики были mean~6.4px и 12.8% пар >10px — заведомо
+     сломанный результат, именно поэтому flow теперь считается по normal_light,
+     см. докстринг collect_clips. Если увидишь на новом прогоне похожие на
+     low_light-паттерн скачки — источник кадров в process_clip где-то съехал
+     обратно на low_light, проверь код.)
+  5. Цветовое кодирование (опционально, для быстрой визуальной оценки):
      `hue = atan2(dy, dx)`, `sat = clip(sqrt(dx**2+dy**2) / max_flow, 0, 1)` ->
      HSV -> RGB — стандартная схема визуализации flow (Middlebury/Sintel).
 """
@@ -117,7 +127,8 @@ import torch.nn.functional as F
 from PIL import Image
 
 
-LIGHT_LEVELS = ['low_light_10', 'low_light_20']   # GT (normal_light_*) сознательно НЕ обрабатывается
+LIGHT_LEVELS = ['low_light_10', 'low_light_20']   # результат сохраняется под этими путями;
+                                                    # источник кадров для RAFT — normal_light_XX (см. collect_clips)
 EXTS = {'.png', '.jpg', '.jpeg'}
 
 
@@ -149,9 +160,28 @@ def resolve_scene_content_dir(scene_dir: Path) -> Path:
 
 def collect_clips(data_roots: list[Path], scene_filter: str = None):
     """
-    Возвращает список клипов: (scene_name, level, frame_paths[sorted]).
-    Один клип = одна сцена x один low_light уровень. GT (normal_light_*)
-    не собирается — flow для него не нужен (см. докстринг модуля).
+    Возвращает список клипов: (scene_name, level, low_frame_paths[sorted], normal_frame_paths[sorted]).
+    Один клип = одна сцена x один low_light уровень.
+
+    ВАЖНО (найдено эмпирически 2026-07-19, см. mempalace wing=LNN_LowLight):
+    RAFT-small СИСТЕМАТИЧЕСКИ даёт мусорный flow на low_light кадрах —
+    картирование по всему клипу S02/low_light_10 показало 12.8% пар с
+    mean|flow|>10px (пики до 160px) на визуально статичной сцене, тогда как
+    normal_light_10 той же сцены даёт стабильный mean~1.4px по всему клипу
+    (0% пар >10px). Гамма-подсветка low_light перед RAFT не помогла (мусор
+    той же формы и величины) — проблема не в видимости яркости для человека,
+    а в том, что RAFT (обучен на Sintel/KITTI/FlyingChairs — хорошо
+    освещённые кадры) не умеет отличать шум сенсора/H.264-компрессии на
+    почти-чёрных пикселях от реального смещения.
+
+    РЕШЕНИЕ: low_light_XX и normal_light_XX — синхронизированные по кадрам
+    съёмки одной и той же физической сцены (проверено эмпирически: offset=0
+    даёт минимальную MSE в 8/9 контрольных точек по всему клипу, 9-я точка —
+    фактическая ничья между offset=0 и offset=-1). Поэтому flow считается на
+    normal_light_XX (где RAFT работает надёжно), а сохраняется под путём
+    low_light_XX — именно low_light кадры будут выравниваться этим flow на
+    Этапе 4, а не normal_light (normal_light тут используется только как
+    "чистый источник" для оценки реального движения камеры/сцены).
     """
     clips = []
     for root in data_roots:
@@ -166,12 +196,32 @@ def collect_clips(data_roots: list[Path], scene_filter: str = None):
             content_dir = resolve_scene_content_dir(scene_dir)
             for level in LIGHT_LEVELS:
                 level_dir = content_dir / level
+                normal_level = level.replace('low_light_', 'normal_light_')
+                normal_dir = content_dir / normal_level
                 if not level_dir.exists():
                     continue
-                frame_paths = sorted([p for p in level_dir.iterdir() if p.suffix.lower() in EXTS])
-                if len(frame_paths) < 2:
+                if not normal_dir.exists():
+                    print(
+                        f"[WARN] {scene_dir.name}/{level}: нет соответствующей "
+                        f"{normal_level} — пропускаю клип (flow считается по "
+                        f"normal_light, без неё клип обработать нельзя)",
+                        file=sys.stderr,
+                    )
                     continue
-                clips.append((scene_dir.name, level, frame_paths))
+
+                low_paths = sorted([p for p in level_dir.iterdir() if p.suffix.lower() in EXTS])
+                normal_paths = sorted([p for p in normal_dir.iterdir() if p.suffix.lower() in EXTS])
+                if len(low_paths) < 2:
+                    continue
+                if len(low_paths) != len(normal_paths):
+                    print(
+                        f"[WARN] {scene_dir.name}/{level}: расхождение числа кадров "
+                        f"low={len(low_paths)} vs normal={len(normal_paths)} — "
+                        f"пропускаю клип (нарушена синхронизация по индексу)",
+                        file=sys.stderr,
+                    )
+                    continue
+                clips.append((scene_dir.name, level, low_paths, normal_paths))
     return clips
 
 
@@ -286,12 +336,19 @@ def compute_flow(model, img1: torch.Tensor, img2: torch.Tensor, iters: int) -> t
 # ----------------------------------------------------------------------------
 # Основной цикл: по клипам -> по парам (i, i+1), resume на обоих уровнях.
 # ----------------------------------------------------------------------------
-def process_clip(model, scene_name, level, frame_paths, out_root: Path, scale: float, device: str, iters: int):
+def process_clip(model, scene_name, level, low_paths, normal_paths, out_root: Path, scale: float, device: str, iters: int):
+    """
+    Считает flow ПО normal_paths (стабильный, надёжный RAFT-инференс — см.
+    docstring collect_clips), но сохраняет результат под путём scene/level,
+    где level = 'low_light_XX' — именно эти кадры будут выравниваться этим
+    flow на Этапе 4. low_paths используется только чтобы знать n_pairs
+    (должно совпадать с normal_paths — уже провалидировано в collect_clips).
+    """
     level_dir = out_root / scene_name / level
     level_dir.mkdir(parents=True, exist_ok=True)
     marker = level_dir / '_complete.marker'
 
-    n_pairs = len(frame_paths) - 1
+    n_pairs = len(low_paths) - 1
     if marker.exists():
         return n_pairs, n_pairs  # (обработано, всего) — уже готово, ничего не считаем
 
@@ -302,8 +359,8 @@ def process_clip(model, scene_name, level, frame_paths, out_root: Path, scale: f
             n_done += 1
             continue
 
-        img1 = load_frame_raft(frame_paths[i], scale, device)
-        img2 = load_frame_raft(frame_paths[i + 1], scale, device)
+        img1 = load_frame_raft(normal_paths[i], scale, device)
+        img2 = load_frame_raft(normal_paths[i + 1], scale, device)
         flow = compute_flow(model, img1, img2, iters)
 
         tmp_dst = dst.with_suffix('.tmp.pt')
@@ -355,16 +412,16 @@ def main():
         print("[ERROR] Не найдено ни одного клипа — проверь --data-root/--scene", file=sys.stderr)
         sys.exit(1)
 
-    total_pairs_expected = sum(len(fp) - 1 for _, _, fp in clips)
+    total_pairs_expected = sum(len(low_p) - 1 for _, _, low_p, _ in clips)
     print(f"      Найдено клипов: {len(clips)}, всего пар кадров (ожидается): {total_pairs_expected}")
 
-    print(f"[3/3] Считаю flow (scale={args.scale}, iters={args.iters})...")
+    print(f"[3/3] Считаю flow (scale={args.scale}, iters={args.iters}, источник=normal_light)...")
     t0 = time.time()
     total_done = 0
-    for clip_idx, (scene_name, level, frame_paths) in enumerate(clips, 1):
+    for clip_idx, (scene_name, level, low_paths, normal_paths) in enumerate(clips, 1):
         clip_t0 = time.time()
         n_done, n_pairs = process_clip(
-            model, scene_name, level, frame_paths, out_root, args.scale, args.device, args.iters
+            model, scene_name, level, low_paths, normal_paths, out_root, args.scale, args.device, args.iters
         )
         total_done += n_done
         dt = time.time() - clip_t0
