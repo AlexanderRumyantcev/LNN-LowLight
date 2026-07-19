@@ -114,11 +114,52 @@
   5. Цветовое кодирование (опционально, для быстрой визуальной оценки):
      `hue = atan2(dy, dx)`, `sat = clip(sqrt(dx**2+dy**2) / max_flow, 0, 1)` ->
      HSV -> RGB — стандартная схема визуализации flow (Middlebury/Sintel).
+
+АРХИВАЦИЯ/ЗАГРУЗКА/ОЧИСТКА ПО СЦЕНЕ (флаг --archive-and-upload, 2026-07-19):
+half-res кэш на весь датасет ~31-32GB, а /kaggle/working ограничен ~20GB
+(persist как output ноутбука) — весь датасет одновременно не помещается.
+Решение — тот же паттерн, что уже применялся для исходных PNG сцен
+(scripts/prepare_bvi_rlv_kaggle_v2.sh на локальном Mac): после того как ОБА
+low_light уровня сцены посчитаны — архивировать (zip + проверка целостности:
+число файлов в архиве == на диске) -> загрузить на Kaggle как ОТДЕЛЬНЫЙ
+датасет НА СЦЕНУ (kaggle datasets create, НЕ version!) -> удалить оригинал
+локально ТОЛЬКО после подтверждённого успеха загрузки. Если архивация или
+загрузка не удалась — данные остаются на диске нетронутыми, скрипт продолжает
+со следующей сцены (это может привести к переполнению диска на поздних сценах,
+если проблема системная, а не разовая — тогда останавливать вручную).
+
+ВАЖНО: один датасет НА СЦЕНУ, а не версионирование одного растущего датасета —
+при загрузке PNG уже ловили баг Kaggle "cannot create new dataset versions
+with existing files that do not belong to the latest version" именно на этом
+паттерне (см. mempalace wing=LNN_LowLight). Создание нового датасета каждый
+раз этот баг не triggers.
+
+ТРЕБУЕТСЯ (настроить в ноутбуке ДО запуска с --archive-and-upload):
+Kaggle API токен в ~/.kaggle/kaggle.json (chmod 600) внутри самой Kaggle-сессии
+— НЕ то же самое, что доступ к /kaggle/input (это read-only и не требует
+токена). Получить токен: Kaggle -> Account -> API -> Create New Token, затем
+загрузить как Kaggle Secret и записать в файл в начале ноутбука:
+    import json, os
+    from kaggle_secrets import UserSecretsClient
+    creds = json.loads(UserSecretsClient().get_secret("KAGGLE_API_TOKEN"))
+    os.makedirs(os.path.expanduser('~/.kaggle'), exist_ok=True)
+    with open(os.path.expanduser('~/.kaggle/kaggle.json'), 'w') as f:
+        json.dump(creds, f)
+    os.chmod(os.path.expanduser('~/.kaggle/kaggle.json'), 0o600)
+Без этого --archive-and-upload будет падать на каждой сцене на шаге upload
+(archive и cleanup при этом не выполнятся — см. ВАЖНО выше, cleanup только
+после подтверждённого успеха).
 """
 
 import argparse
+import json
+import shutil
+import subprocess
 import sys
 import time
+import zipfile
+from itertools import groupby
+from operator import itemgetter
 from pathlib import Path
 
 import numpy as np
@@ -374,6 +415,110 @@ def process_clip(model, scene_name, level, low_paths, normal_paths, out_root: Pa
     return n_done, n_pairs
 
 
+# ----------------------------------------------------------------------------
+# Архивация/загрузка/очистка по сцене (--archive-and-upload) — см. докстринг
+# модуля, раздел "АРХИВАЦИЯ/ЗАГРУЗКА/ОЧИСТКА ПО СЦЕНЕ" для контекста и
+# обоснования. Три отдельные функции ровно как в prepare_bvi_rlv_kaggle_v2.sh
+# (archive -> upload -> cleanup), а не одна общая — чтобы вызывающий код мог
+# явно проверить успех каждого шага перед следующим (особенно перед cleanup:
+# удалять можно только после подтверждённой загрузки).
+# ----------------------------------------------------------------------------
+def archive_scene(scene_out_dir: Path, zip_path: Path) -> bool:
+    """
+    Архивирует ВСЕ файлы сцены (low_light_10/*.pt, low_light_20/*.pt, маркеры)
+    в один zip, затем проверяет целостность: testzip() + сверка числа файлов
+    в архиве с числом файлов на диске. Возвращает False при любом расхождении
+    — вызывающий код НЕ должен продолжать на upload/cleanup в этом случае.
+    """
+    if not scene_out_dir.is_dir():
+        print(f"[ERROR] {scene_out_dir} не существует, нечего архивировать", file=sys.stderr)
+        return False
+
+    all_files = sorted(f for f in scene_out_dir.rglob('*') if f.is_file())
+    if not all_files:
+        print(f"[ERROR] {scene_out_dir} пуст, нечего архивировать", file=sys.stderr)
+        return False
+
+    # compresslevel=1 (не 9-максимум по умолчанию) — flow это уже бинарные
+    # fp16-данные, почти не сжимаются, а высокий уровень сжатия только тратит
+    # CPU-время впустую на многогигабайтном архиве.
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for f in all_files:
+            zf.write(f, f.relative_to(scene_out_dir.parent))
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        bad = zf.testzip()
+        if bad is not None:
+            print(f"[ERROR] Архив {zip_path.name} повреждён (bad file: {bad})", file=sys.stderr)
+            return False
+        n_in_zip = len(zf.namelist())
+
+    if n_in_zip != len(all_files):
+        print(
+            f"[ERROR] Расхождение числа файлов у {zip_path.name}: "
+            f"в архиве {n_in_zip}, на диске {len(all_files)}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"      [archive] {zip_path.name}: {len(all_files)} файлов, "
+          f"{zip_path.stat().st_size / 1024**3:.2f} GB, целостность подтверждена")
+    return True
+
+
+def upload_scene_dataset(zip_path: Path, scene_name: str, dataset_prefix: str, kaggle_username: str) -> bool:
+    """
+    Создаёт ОТДЕЛЬНЫЙ Kaggle Dataset на сцену через `kaggle datasets create`
+    (НЕ `kaggle datasets version` — см. докстринг модуля про баг с
+    версионированием растущего датасета, уже пойманный на PNG). Private по
+    умолчанию — это промежуточный рабочий кэш, не публикация.
+    """
+    slug = f"{dataset_prefix}-{scene_name}".lower().replace('_', '-')
+    upload_dir = zip_path.parent / f"_upload_{scene_name}"
+    if upload_dir.exists():
+        shutil.rmtree(upload_dir)
+    upload_dir.mkdir(parents=True)
+
+    staged_zip = upload_dir / zip_path.name
+    shutil.copy2(zip_path, staged_zip)
+
+    metadata = {
+        "title": f"BVI-RLV flow cache ({scene_name}, half-res, RAFT-small on normal_light)",
+        "id": f"{kaggle_username}/{slug}",
+        "licenses": [{"name": "CC0-1.0"}],
+    }
+    (upload_dir / "dataset-metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    result = subprocess.run(
+        ["kaggle", "datasets", "create", "-p", str(upload_dir), "-q", "--dir-mode", "zip"],
+        capture_output=True, text=True,
+    )
+    shutil.rmtree(upload_dir, ignore_errors=True)
+
+    if result.returncode != 0:
+        print(
+            f"[ERROR] kaggle datasets create упал для {scene_name} (код {result.returncode}):\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"      [upload] {kaggle_username}/{slug} создан")
+    return True
+
+
+def cleanup_scene(scene_out_dir: Path, zip_path: Path):
+    """
+    Удаляет локальный оригинал + zip. Вызывать ТОЛЬКО после того, как
+    archive_scene() и upload_scene_dataset() оба вернули True — сам cleanup_scene
+    это не проверяет (проверка — ответственность вызывающего кода в main()),
+    чтобы не потерять данные при частичном сбое где-то в середине цепочки.
+    """
+    shutil.rmtree(scene_out_dir, ignore_errors=True)
+    if zip_path.exists():
+        zip_path.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-root', action='append', required=True,
@@ -393,6 +538,14 @@ def main():
                               "(например --scene S02) — для проверки перед полным прогоном.")
     parser.add_argument('--device', default='cuda',
                          help='cuda или cpu (cuda обязателен для приемлемой скорости на полном датасете).')
+    parser.add_argument('--archive-and-upload', action='store_true',
+                         help='После завершения ОБОИХ low_light уровней сцены — заархивировать, '
+                              'загрузить как отдельный Kaggle Dataset и удалить локальную копию. '
+                              'См. докстринг модуля, требует настроенный ~/.kaggle/kaggle.json.')
+    parser.add_argument('--kaggle-username', default='alexanderrunyantcev',
+                         help='Kaggle username для --archive-and-upload (владелец создаваемых датасетов).')
+    parser.add_argument('--kaggle-dataset-prefix', default='bvi-rlv-flow',
+                         help='Префикс имени датасета на сцену: <prefix>-<scene_name> (в нижнем регистре).')
     args = parser.parse_args()
 
     if args.scale <= 0 or args.scale > 1:
@@ -402,6 +555,16 @@ def main():
     data_roots = [Path(r) for r in args.data_root]
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    if args.archive_and_upload and shutil.which('kaggle') is None:
+        print(
+            "[ERROR] --archive-and-upload указан, но команда 'kaggle' не найдена в PATH "
+            "(пакет kaggle обычно уже установлен на Kaggle-нотубках, но её отсутствие "
+            "означает, что архивация/загрузка гарантированно упадёт на первой же сцене). "
+            "Прерываю запуск сейчас, а не после часа вычислений.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print(f"[1/3] Загружаю RAFT-small (device={args.device})...")
     model = load_raft_small(Path(args.raft_repo), Path(args.raft_weights), args.device)
@@ -413,34 +576,63 @@ def main():
         sys.exit(1)
 
     total_pairs_expected = sum(len(low_p) - 1 for _, _, low_p, _ in clips)
-    print(f"      Найдено клипов: {len(clips)}, всего пар кадров (ожидается): {total_pairs_expected}")
+    n_scenes = len({c[0] for c in clips})
+    print(f"      Найдено клипов: {len(clips)} ({n_scenes} сцен), всего пар кадров (ожидается): {total_pairs_expected}")
 
-    print(f"[3/3] Считаю flow (scale={args.scale}, iters={args.iters}, источник=normal_light)...")
+    print(f"[3/3] Считаю flow (scale={args.scale}, iters={args.iters}, источник=normal_light"
+          + (", archive-and-upload ВКЛЮЧЁН" if args.archive_and_upload else "") + ")...")
     t0 = time.time()
     total_done = 0
-    for clip_idx, (scene_name, level, low_paths, normal_paths) in enumerate(clips, 1):
-        clip_t0 = time.time()
-        n_done, n_pairs = process_clip(
-            model, scene_name, level, low_paths, normal_paths, out_root, args.scale, args.device, args.iters
-        )
-        total_done += n_done
-        dt = time.time() - clip_t0
-        elapsed = time.time() - t0
-        avg_per_clip = elapsed / clip_idx
-        remaining = avg_per_clip * (len(clips) - clip_idx)
-        print(
-            f"      [{clip_idx}/{len(clips)}] {scene_name}/{level}: "
-            f"{n_done}/{n_pairs} пар за {dt:.1f}с | "
-            f"итого {total_done}/{total_pairs_expected} | "
-            f"осталось ~{remaining/60:.1f} мин",
-            flush=True,
-        )
+    clip_idx = 0
+    scene_idx = 0
+
+    for scene_name, scene_clips_iter in groupby(clips, key=itemgetter(0)):
+        scene_idx += 1
+        scene_clips = list(scene_clips_iter)
+        for (_, level, low_paths, normal_paths) in scene_clips:
+            clip_idx += 1
+            clip_t0 = time.time()
+            n_done, n_pairs = process_clip(
+                model, scene_name, level, low_paths, normal_paths, out_root, args.scale, args.device, args.iters
+            )
+            total_done += n_done
+            dt = time.time() - clip_t0
+            elapsed = time.time() - t0
+            avg_per_clip = elapsed / clip_idx
+            remaining = avg_per_clip * (len(clips) - clip_idx)
+            print(
+                f"      [{clip_idx}/{len(clips)}] {scene_name}/{level}: "
+                f"{n_done}/{n_pairs} пар за {dt:.1f}с | "
+                f"итого {total_done}/{total_pairs_expected} | "
+                f"осталось ~{remaining/60:.1f} мин",
+                flush=True,
+            )
+
+        if args.archive_and_upload:
+            scene_out_dir = out_root / scene_name
+            zip_path = out_root / f"{scene_name}.zip"
+            print(f"      [{scene_idx}/{n_scenes}] Архивирую {scene_name}...")
+            if not archive_scene(scene_out_dir, zip_path):
+                print(f"[WARN] Архивация {scene_name} не удалась — оригинал остаётся на диске, "
+                      f"продолжаю со следующей сцены", file=sys.stderr)
+                continue
+            print(f"      [{scene_idx}/{n_scenes}] Загружаю {scene_name} на Kaggle...")
+            if upload_scene_dataset(zip_path, scene_name, args.kaggle_dataset_prefix, args.kaggle_username):
+                cleanup_scene(scene_out_dir, zip_path)
+                free_gb = shutil.disk_usage(out_root).free / 1024**3
+                print(f"      [{scene_idx}/{n_scenes}] {scene_name}: готово, локальные файлы очищены, "
+                      f"свободно на диске: {free_gb:.1f} GB")
+            else:
+                print(f"[WARN] Загрузка {scene_name} не удалась — оригинал и zip остаются на диске "
+                      f"(МЕСТО НЕ ОСВОБОЖДЕНО, возможен disk-full на следующих сценах)", file=sys.stderr)
 
     dt_total = time.time() - t0
     print(f"\nГотово за {dt_total/60:.1f} мин. Пар посчитано (за этот запуск + уже готовые): {total_done}")
 
     total_flow_bytes = sum(f.stat().st_size for f in out_root.rglob('*.pt'))
-    print(f"Итоговый размер flow-кэша: {total_flow_bytes / 1024**3:.2f} GB (ориентир по Этапу 1: ~32.7 GB на весь датасет)")
+    print(f"Итоговый размер flow-кэша на диске сейчас: {total_flow_bytes / 1024**3:.2f} GB "
+          f"(если archive-and-upload включён — это остаток НЕ выгруженного/недавно посчитанного, "
+          f"не общий объём за весь прогон)")
 
 
 if __name__ == '__main__':
