@@ -86,15 +86,27 @@ def test_get_flow_to_anchor_directions():
     check("frame_idx == anchor_idx -> нулевой flow", torch.allclose(flow_same, torch.zeros_like(flow_same)))
     check("frame_idx == anchor_idx -> нулевая маска", occ_same.sum().item() == 0)
 
+    # frame_idx < anchor_idx (прошлый кадр — ОСНОВНОЙ случай при текущей
+    # каузальной схеме окна): цепочка flow[0],flow[1] стартует с flow[0],
+    # которое живёт на сетке frame_idx=0 -> композиция получается на сетке
+    # frame_idx, нужна splat-инверсия, чтобы попасть на сетку anchor_idx.
+    # composed forward dx = 1+1 = 2 -> backward dx ≈ -2, occlusion не нулевая.
     flow_past, occ_past = get_flow_to_anchor(neighbor_flows, frame_idx=0, anchor_idx=2)
-    check("frame_idx < anchor_idx -> forward-композиция (dx≈2.0)",
-          abs(flow_past.mean(dim=(1, 2))[0].item() - 2.0) < 1e-3)
-    check("frame_idx < anchor_idx -> occlusion всегда нулевая (forward, дыр нет)",
-          occ_past.sum().item() == 0)
+    interior_past = ~occ_past[0].bool()
+    check("frame_idx < anchor_idx -> splat-инверсия (dx≈-2.0 во внутренней области)",
+          abs(flow_past[:, interior_past].mean(dim=1)[0].item() + 2.0) < 1e-2)
+    check("frame_idx < anchor_idx -> occlusion НЕ нулевая (splat даёт дыры на краю)",
+          occ_past.sum().item() > 0)
 
+    # frame_idx > anchor_idx (будущий кадр — при текущей каузальной схеме
+    # окна не встречается, но функция общая): цепочка flow[2],flow[3]
+    # стартует с flow[2], которое уже живёт на сетке anchor_idx=2 ->
+    # композиция готова напрямую, инверсия не нужна, дыр не даёт.
     flow_future, occ_future = get_flow_to_anchor(neighbor_flows, frame_idx=4, anchor_idx=2)
-    check("frame_idx > anchor_idx -> backward (dx≈-2.0 во внутренней области)",
-          abs(flow_future[:, ~occ_future[0].bool()].mean(dim=1)[0].item() + 2.0) < 1e-2)
+    check("frame_idx > anchor_idx -> forward-композиция (dx≈2.0)",
+          abs(flow_future.mean(dim=(1, 2))[0].item() - 2.0) < 1e-3)
+    check("frame_idx > anchor_idx -> occlusion всегда нулевая (gather, дыр нет)",
+          occ_future.sum().item() == 0)
 
 
 if __name__ == "__main__":

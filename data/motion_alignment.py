@@ -10,29 +10,37 @@ t для конкретного окна получается композици
 чтения батча"), функции здесь предназначены для вызова ОНЛАЙН из dataloader
 (интеграция — Этап 4, из этого модуля пока не делается).
 
-ДВЕ РАЗНЫЕ ОПЕРАЦИИ ПОД КАПОТОМ:
+ДВЕ РАЗНЫЕ ОПЕРАЦИИ ПОД КАПОТОМ (ВАЖНО: направление ниже — исправлено
+2026-07-20 после ручной перепроверки конвенции grid_sample; в первой версии
+модуля было перепутано, см. mempalace wing=LNN_LowLight, decisions):
 
-  1. FORWARD-КОМПОЗИЦИЯ (compose_flow_chain), gather-семантика:
-     Нужна, когда исходный кадр РАНЬШЕ опорного (anchor) кадра по времени
-     (frame_idx < anchor_idx). Идём по цепочке flow[frame_idx -> frame_idx+1],
-     ..., flow[anchor_idx-1 -> anchor_idx] и на каждом шаге "спрашиваем"
-     следующее flow-поле в точке, куда нас уже сместило накопленное смещение
-     (torch.grid_sample). Результат остаётся на регулярной сетке frame_idx
-     и корректен без дырок (каждый исходный пиксель имеет ровно одно
-     назначение).
+  Ключевое правило: grid_sample(input, grid) требует, чтобы grid был
+  ОПРЕДЕЛЁН НА СЕТКЕ РЕЗУЛЬТАТА (anchor), а не на сетке input. Композиция
+  neighbor-flow всегда получается на сетке ПЕРВОГО элемента цепочки — значит,
+  нужна ли инверсия, зависит от того, с чьей сетки цепочка стартует.
+
+  1. FORWARD-КОМПОЗИЦИЯ (compose_flow_chain), gather-семантика, БЕЗ инверсии:
+     Применяется, когда исходный кадр ПОЗЖЕ опорного (frame_idx > anchor_idx,
+     "будущий" кадр относительно anchor — в текущей каузальной схеме окна
+     (anchor = последний кадр) такого не бывает, но функция общая). Цепочка
+     flow[anchor_idx], ..., flow[frame_idx-1] стартует с flow[anchor_idx],
+     который уже живёт на сетке anchor_idx — то есть результат композиции
+     сразу на нужной (anchor) сетке, инверсия не нужна.
 
   2. SPLAT-ИНВЕРСИЯ (splat_invert_flow), scatter-семантика:
-     Нужна, когда исходный кадр ПОЗЖЕ опорного кадра (frame_idx > anchor_idx)
-     — то есть требуется backward-flow (из будущего в прошлое), а
-     precompute_flow.py считает только forward (i -> i+1). Пересчитывать
-     RAFT в обратную сторону — лишний дорогой шаг и источник рассинхрона с
-     уже провалидированным forward-кэшем, поэтому вместо этого:
-       a) forward-композицией строим flow anchor_idx -> frame_idx (это
-          обычная операция #1, направление времени вперёд);
+     Применяется, когда исходный кадр РАНЬШЕ опорного (frame_idx < anchor_idx
+     — это ОСНОВНОЙ случай при текущей каузальной схеме окна: все 4
+     не-опорных кадра окна прошлые). Цепочка flow[frame_idx], ...,
+     flow[anchor_idx-1] стартует с flow[frame_idx], который живёт на сетке
+     frame_idx — то есть композиция получается на сетке ИСТОЧНИКА, а не
+     anchor, и напрямую как grid для grid_sample непригодна (тихая ошибка
+     выравнивания, а не падение). Поэтому:
+       a) forward-композицией строим flow frame_idx -> anchor_idx (на сетке
+          frame_idx, обычная операция #1);
        b) полученный flow ИНВЕРТИРУЕМ через billinear splatting: каждый
           вектор -flow(x,y) "разбрызгивается" (в отличие от grid_sample,
           который "собирает") из своей исходной позиции (регулярная сетка
-          anchor_idx) в целевую, обычно дробную позицию в кадре frame_idx,
+          frame_idx) в целевую, обычно дробную позицию в кадре anchor_idx,
           с весами по 4 ближайшим целым пикселям.
      После splatting неизбежно возникают:
        - ДЫРЫ (ни один вектор не долетел) = дезокклюзия: область, видимая в
@@ -58,11 +66,15 @@ t для конкретного окна получается композици
   где neighbor_flows — dict[int, Tensor[2,H,W]], neighbor_flows[t] = flow
   (t -> t+1), загруженный из кэша Этапа 2 (scripts/precompute_flow.py) для
   всех t в диапазоне [min(frame_idx,anchor_idx), max(frame_idx,anchor_idx)).
-  flow: Tensor[2,H,W] — смещение, которое нужно применить к frame_idx через
-  grid_sample, чтобы выровнять его к сетке anchor_idx (frame_idx -> anchor).
-  occlusion_mask: Tensor[1,H,W] uint8, 1 = не доверять flow в этом пикселе
-  (для frame_idx < anchor_idx маска всегда нулевая — forward-композиция дыр
-  не даёт; ненулевой она может быть только при frame_idx > anchor_idx).
+  flow: Tensor[2,H,W] — grid-смещение (в пикселях, на сетке anchor_idx),
+  готовое для прямого использования как sampling grid в grid_sample при
+  warping frame_idx на сетку anchor_idx.
+  occlusion_mask: Tensor[1,H,W] uint8, 1 = не доверять flow в этом пикселе.
+  ПРИ ТЕКУЩЕЙ КАУЗАЛЬНОЙ СХЕМЕ ОКНА (anchor = последний кадр, все прочие —
+  прошлые, frame_idx < anchor_idx) маска НЕ нулевая — это основной, а не
+  краевой случай: splat-инверсия и её дыры/коллизии участвуют в каждом
+  вызове. Нулевой она гарантированно будет только при frame_idx > anchor_idx
+  (будущий кадр, при текущей схеме окна не встречается).
 
 Unit-тест на синтетическом сдвиге: см. test_motion_alignment.py в корне репо.
 """
@@ -230,13 +242,20 @@ def get_flow_to_anchor(
         return zero_flow, zero_mask
 
     if frame_idx < anchor_idx:
-        # прошлое -> опорный кадр: чистая forward-композиция, дыр не даёт
+        # ОСНОВНОЙ случай при текущей каузальной схеме окна: frame_idx —
+        # прошлый кадр. Цепочка flow[frame_idx..anchor_idx-1] стартует с
+        # flow[frame_idx] -> композиция получается НА СЕТКЕ frame_idx, а не
+        # anchor_idx. Для grid_sample нужна сетка anchor_idx -> инвертируем
+        # через splatting (см. докстринг модуля).
         chain = [neighbor_flows[t] for t in range(frame_idx, anchor_idx)]
-        flow = compose_flow_chain(chain)
-        occlusion = torch.zeros(1, *flow.shape[-2:], dtype=torch.uint8, device=flow.device)
-        return flow, occlusion
+        forward_composed = compose_flow_chain(chain)          # на сетке frame_idx
+        return splat_invert_flow(forward_composed, importance_scale)  # на сетке anchor_idx
 
-    # frame_idx > anchor_idx: будущее -> опорный кадр, нужен backward
+    # frame_idx > anchor_idx: будущий кадр (при текущей каузальной схеме окна
+    # не встречается, но функция общая). Цепочка flow[anchor_idx..frame_idx-1]
+    # стартует с flow[anchor_idx] -> композиция УЖЕ на сетке anchor_idx,
+    # инверсия не нужна, дыр не даёт (gather-семантика).
     chain = [neighbor_flows[t] for t in range(anchor_idx, frame_idx)]
-    forward_composed = compose_flow_chain(chain)          # anchor -> frame_idx
-    return splat_invert_flow(forward_composed, importance_scale)  # frame_idx -> anchor
+    flow = compose_flow_chain(chain)
+    occlusion = torch.zeros(1, *flow.shape[-2:], dtype=torch.uint8, device=flow.device)
+    return flow, occlusion
