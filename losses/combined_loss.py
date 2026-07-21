@@ -33,7 +33,14 @@ class SSIMLoss(nn.Module):
         _2d = _1d.mm(_1d.t()).float().unsqueeze(0).unsqueeze(0)
         return _2d.expand(channel, 1, window_size, window_size).contiguous()
 
-    def _ssim(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def _ssim(self, x: torch.Tensor, y: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        valid_mask: опционально [B,1,H,W], 1=доверять пикселю, 0=игнорировать
+        (occlusion из Этапа 3/4 motion alignment — область, где входные кадры
+        окна не имели корректного flow-выравнивания). conv2d с padding=win//2
+        сохраняет H,W, поэтому ssim_map и valid_mask совпадают по форме без
+        дополнительного кропа.
+        """
         win = self.window.to(x.device)
         pad = self.window_size // 2
         mu_x = F.conv2d(x, win, padding=pad, groups=self.channel)
@@ -45,10 +52,20 @@ class SSIMLoss(nn.Module):
         C1, C2 = 0.01 ** 2, 0.03 ** 2
         ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / \
                    ((mu_x2 + mu_y2 + C1) * (sigma_x + sigma_y + C2))
-        return ssim_map.mean()
+        if valid_mask is None:
+            return ssim_map.mean()
+        # ssim_map: [B,C,H,W], valid_mask: [B,1,H,W] -> broadcast по каналам
+        valid = valid_mask.expand_as(ssim_map)
+        denom = valid.sum().clamp_min(1.0)
+        return (ssim_map * valid).sum() / denom
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return 1.0 - self._ssim(pred, target)
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return 1.0 - self._ssim(pred, target, valid_mask)
 
 
 class TemporalConsistencyLoss(nn.Module):
@@ -64,10 +81,16 @@ class TemporalConsistencyLoss(nn.Module):
         enhanced_curr: torch.Tensor,
         low_prev: torch.Tensor,
         low_curr: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Маска: пиксели где входные кадры похожи (нет движения/резких изменений)
         diff_input = (low_curr - low_prev).abs().mean(dim=1, keepdim=True)
         weight = torch.exp(-diff_input * 10.0)  # сильная разница → низкий вес
+        if valid_mask is not None:
+            # occlusion из motion alignment (Этап 3/4): дополнительно занижаем
+            # вес там, где выравнивание входных кадров недостоверно (дыры/
+            # коллизии splat-инверсии) — независимо от diff_input-эвристики.
+            weight = weight * valid_mask
         loss = (weight * (enhanced_curr - enhanced_prev).abs()).mean()
         return loss
 
@@ -104,12 +127,25 @@ class CombinedLoss(nn.Module):
         enhanced_prev: torch.Tensor | None = None,
         low_prev: torch.Tensor | None = None,
         low_curr: torch.Tensor | None = None,
+        occlusion: torch.Tensor | None = None,
     ) -> dict:
         """
         Returns dict с отдельными loss'ами и total.
+
+        occlusion: опционально [B,1,H,W], 1=пиксель не доверять (Этап 3/4
+        motion alignment — дыры/коллизии splat-инверсии в окне относительно
+        опорного кадра). Если None (нет flow-выравнивания в пайплайне) —
+        поведение идентично прежнему, немаскированному loss.
         """
-        l_pixel = self.l1(pred, target)
-        l_ssim = self.ssim(pred, target)
+        valid_mask = None if occlusion is None else (1.0 - occlusion.float())
+
+        if valid_mask is None:
+            l_pixel = self.l1(pred, target)
+        else:
+            valid3 = valid_mask.expand_as(pred)
+            l_pixel = ((pred - target).abs() * valid3).sum() / valid3.sum().clamp_min(1.0)
+
+        l_ssim = self.ssim(pred, target, valid_mask)
 
         losses = {
             'pixel': l_pixel,
@@ -119,7 +155,7 @@ class CombinedLoss(nn.Module):
         total = self.lambda_pixel * l_pixel + self.lambda_ssim * l_ssim
 
         if enhanced_prev is not None and low_prev is not None and low_curr is not None:
-            l_temp = self.temporal(enhanced_prev, pred, low_prev, low_curr)
+            l_temp = self.temporal(enhanced_prev, pred, low_prev, low_curr, valid_mask)
             losses['temporal'] = l_temp
             total = total + self.lambda_temporal * l_temp
         else:

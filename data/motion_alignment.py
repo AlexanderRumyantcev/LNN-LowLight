@@ -259,3 +259,61 @@ def get_flow_to_anchor(
     flow = compose_flow_chain(chain)
     occlusion = torch.zeros(1, *flow.shape[-2:], dtype=torch.uint8, device=flow.device)
     return flow, occlusion
+
+
+# ---------------------------------------------------------------------------
+# 4. Апсемпл кэшированного flow + сам warp кадра (нужны Этапу 4, dataloader)
+# ---------------------------------------------------------------------------
+
+def upsample_flow(flow: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """
+    Приводит flow, посчитанный на half-res (scripts/precompute_flow.py,
+    scale=0.5 от исходного разрешения PNG), к нативному разрешению кадров,
+    которые реально грузит BVIRLVDataset (load_image/load_image_npy читают
+    PNG/.npy в их исходном, НЕ уменьшенном разрешении).
+
+    Важно: мало просто интерполировать пространственно — величины смещения
+    (в пикселях) тоже нужно домножить на коэффициент масштаба, иначе flow
+    останется "в единицах половинного разрешения" и после интерполяции будет
+    указывать вдвое меньше, чем нужно, на кадре полного размера (тихая
+    ошибка величины, не координат — тоже давала бы правдоподобный, но
+    неверный результат).
+
+    flow: [2, Hc, Wc] (Hc, Wc — разрешение кэша)
+    Возвращает: [2, target_h, target_w]
+    """
+    _, hc, wc = flow.shape
+    if hc == target_h and wc == target_w:
+        return flow
+    scale_x = target_w / wc
+    scale_y = target_h / hc
+    flow_up = F.interpolate(
+        flow.unsqueeze(0).float(), size=(target_h, target_w),
+        mode="bilinear", align_corners=False,
+    )[0]
+    flow_up = torch.stack([flow_up[0] * scale_x, flow_up[1] * scale_y], dim=0)
+    return flow_up
+
+
+def warp_frame(frame: torch.Tensor, flow_to_anchor: torch.Tensor) -> torch.Tensor:
+    """
+    Warp-ит frame (например, прошлый кадр окна) на сетку опорного (anchor)
+    кадра через grid_sample, используя flow_to_anchor из get_flow_to_anchor
+    (уже определён на сетке anchor — готов к прямому использованию как
+    sampling grid, инверсия/композиция уже сделаны раньше).
+
+    frame:          [3, H, W] float, кадр-источник (тот, который выравниваем)
+    flow_to_anchor: [2, H, W] пиксельное смещение, на сетке anchor
+    Возвращает:     [3, H, W] — frame, выровненный на сетку anchor
+    """
+    _, h, w = frame.shape
+    base_grid = _make_base_grid(h, w, frame.device, torch.float32)
+    sample_xy = base_grid + flow_to_anchor.float()
+    x_norm = 2.0 * sample_xy[0] / max(w - 1, 1) - 1.0
+    y_norm = 2.0 * sample_xy[1] / max(h - 1, 1) - 1.0
+    grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)  # [1, H, W, 2]
+    warped = F.grid_sample(
+        frame.unsqueeze(0).float(), grid,
+        mode="bilinear", padding_mode="border", align_corners=True,
+    )
+    return warped[0]
