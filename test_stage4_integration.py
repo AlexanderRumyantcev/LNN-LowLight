@@ -330,6 +330,36 @@ def test_train_loop_wires_occlusion(data_root, flow_root):
           all(o is not None for o in spy_val.received))
 
 
+def test_scenes_filter(root):
+    info("Тест 10: scenes= ограничивает датасет только запрошенными сценами (для Этапа 5 sanity-check)")
+    data_root, flow_root = build_synthetic_scene(root)
+    scene2 = data_root / 'TestScene2'
+    (scene2 / 'low_light_10').mkdir(parents=True)
+    (scene2 / 'normal_light_10').mkdir(parents=True)
+    for t in range(N_FRAMES):
+        frame = _make_frame(0, 0)
+        frame.save(scene2 / 'normal_light_10' / f"{t:05d}.png")
+        frame.save(scene2 / 'low_light_10' / f"{t:05d}.png")
+
+    ds = BVIRLVDataset(
+        data_root=str(data_root), split='train', window_size=5, patch_size=0,
+        augment=False, train_ratio=1.0, scenes=['TestScene'],
+    )
+    names = {ds.samples[i][2] for i in range(len(ds))}
+    check("scenes=['TestScene'] оставляет только TestScene (TestScene2 исключена)",
+          names == {'TestScene'})
+
+    raised = False
+    try:
+        BVIRLVDataset(
+            data_root=str(data_root), split='train', window_size=5, patch_size=0,
+            augment=False, train_ratio=1.0, scenes=['NoSuchScene'],
+        )
+    except RuntimeError:
+        raised = True
+    check("scenes с несуществующим именем -> RuntimeError (не пустой датасет молча)", raised)
+
+
 if __name__ == "__main__":
     tmp_root = Path(tempfile.mkdtemp(prefix="lnn_lowlight_stage4_"))
     try:
@@ -347,7 +377,7 @@ if __name__ == "__main__":
         shutil.rmtree(tmp_root, ignore_errors=True)
 
     for test_fn in (test_missing_partial_flow_fallback, test_double_nested_flow_dir,
-                    test_scene_exclusion_when_flow_missing):
+                    test_scene_exclusion_when_flow_missing, test_scenes_filter):
         tmp_root = Path(tempfile.mkdtemp(prefix="lnn_lowlight_stage4_"))
         try:
             test_fn(tmp_root)

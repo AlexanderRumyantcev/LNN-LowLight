@@ -310,6 +310,7 @@ class BVIRLVDataset(Dataset):
         npy_cache_root=None,
         flow_root=None,
         importance_scale: float = 1.0,
+        scenes=None,
     ):
         """
         data_root: путь к папке с сценами (str) ЛИБО список таких путей (list[str]).
@@ -326,6 +327,13 @@ class BVIRLVDataset(Dataset):
         alignment) — опциональное online-выравнивание кадров окна через
         data/motion_alignment.py. flow_root=None (по умолчанию) — поведение
         без изменений от Этапов 1-3.
+
+        scenes: опциональный список имён сцен (например ["S02_animals1",
+        "S06_lego"]) — ограничивает датасет ТОЛЬКО этими сценами (остальные
+        полностью исключаются, до train/test сплита). Нужен для sanity-check
+        на маленькой подвыборке (Этап 5 ТЗ motion alignment: 2-3 сцены вместо
+        всего датасета). Если None (по умолчанию) — используются все сцены,
+        найденные в data_root(s), как раньше.
         """
         super().__init__()
         self.window_size = window_size
@@ -364,6 +372,17 @@ class BVIRLVDataset(Dataset):
                 f"[BVIRLVDataset] Пропущены сцены без low_light_*/normal_light_* "
                 f"подпапок: {skipped_scenes}"
             )
+
+        if scenes is not None:
+            wanted = set(scenes)
+            found_scenes = {t[2] for t in all_seq_pairs}
+            missing_wanted = wanted - found_scenes
+            if missing_wanted:
+                raise RuntimeError(
+                    f"BVIRLVDataset: scenes={sorted(missing_wanted)} запрошены, "
+                    f"но не найдены среди {sorted(found_scenes)}"
+                )
+            all_seq_pairs = [t for t in all_seq_pairs if t[2] in wanted]
 
         if not all_seq_pairs:
             raise RuntimeError(f"BVI-RLV: no sequences found in {data_roots}")
@@ -749,6 +768,7 @@ def build_dataset(cfg: dict, split: str):
             npy_cache_root=cfg.get('npy_cache_root'),
             flow_root=cfg.get('flow_root'),
             importance_scale=cfg.get('importance_scale', 1.0),
+            scenes=cfg.get('scenes'),
         )
     elif name == 'sdsd':
         return SDSDDataset(
