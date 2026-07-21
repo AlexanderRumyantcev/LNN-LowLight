@@ -1,0 +1,70 @@
+name: retinex_transformer_bvirlv_stage5_sanity
+temporal_type: transformer
+# Этап 5 ТЗ motion alignment — SANITY-CHECK, не финальный эксперимент (это
+# Этап 6). Тот же датасет/окно/выравнивание, что и в
+# retinex_cfc_bvirlv_stage5_sanity.yaml — сравниваются ТОЛЬКО temporal-модули
+# на одинаковых выровненных данных (см. ответ пользователю от 2026-07-21 про
+# честность сравнения при общем flow_root для обеих архитектур).
+#
+# ВАЖНО: temporal-голова стартует С НУЛЯ (см. комментарий в CfC-конфиге) —
+# НЕ передавайте --resume.
+#
+# Запуск (ПОСЛЕ CfC-прогона — нужен его backbone-чекпоинт):
+#   python train.py --config configs/retinex_transformer_bvirlv_stage5_sanity.yaml \
+#       --init-backbone-from /kaggle/working/experiments/checkpoints/cfc_bvirlv_stage5_sanity/latest.pth \
+#       --wall-clock-limit-sec 3600 --checkpoint-every-sec 300
+#
+# Без --init-backbone-from backbone получит свою случайную инициализацию
+# (другую, чем у CfC-прогона на этом же sanity-check) — тогда сравнение
+# temporal-модулей смешается с шумом от разной инициализации backbone.
+
+model:
+  n_feat: 32
+  stage: 1
+  num_blocks: [1, 1, 1]
+  window_size: 5
+  hidden_dim: 64
+  n_neurons: 32
+  fps: 25.0
+  freeze_backbone: true
+  backbone_lr_scale: 0.1
+
+dataset:
+  name: bvi_rlv
+  data_root:
+    - /kaggle/input/bvi-rlv-low-light-video-dataset-20-scene-subset
+  scenes:
+    - S02_animals1
+    - S06_lego
+    - S11_gift_wrap
+  flow_root:
+    - /kaggle/input/bvi-rlv-flow-s02-animals1
+    - /kaggle/input/bvi-rlv-flow-s06-lego
+    - /kaggle/input/bvi-rlv-flow-s11-gift-wrap
+  importance_scale: 1.0
+  patch_size: 256
+  window_size: 5
+  fps: 25.0
+  train_ratio: 0.85
+  seed: 42
+
+train:
+  batch_size: 4
+  num_workers: 4
+  epochs: 5
+  lr: 0.0002
+  lr_min: 0.000001
+  warmup_epochs: 1
+  save_every: 1
+  val_every: 1
+  finetune_epoch: 999
+
+loss:
+  lambda_pixel: 1.0
+  lambda_ssim: 0.1
+  lambda_temporal: 0.05
+
+paths:
+  checkpoints: /kaggle/working/experiments/checkpoints/transformer_bvirlv_stage5_sanity
+  logs: /kaggle/working/experiments/logs/transformer_bvirlv_stage5_sanity
+  results: /kaggle/working/experiments/results/transformer_bvirlv_stage5_sanity

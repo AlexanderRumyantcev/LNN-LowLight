@@ -1,0 +1,79 @@
+name: retinex_cfc_bvirlv_stage5_sanity
+temporal_type: cfc
+# Этап 5 ТЗ motion alignment — SANITY-CHECK, не финальный эксперимент (это
+# Этап 6). Цель: убедиться, что online-warping (Этап 4) не падает на реальных
+# данных, loss убывает, overhead по времени приемлемый — на 3 сценах вместо
+# всего датасета. См. mempalace wing=LNN_LowLight, decisions (запись про
+# Этап 5) для контекста решений.
+#
+# ВАЖНО (по решению пользователя от 2026-07-21): temporal-голова стартует
+# С НУЛЯ (свежая инициализация), а не --resume от старого diagnostic-
+# чекпоинта, обученного на невыровненных данных — иначе эффект выравнивания
+# смешается с эффектом "ещё немного обучения" и результат станет
+# неинтерпретируемым. НЕ передавайте --resume при запуске этого конфига.
+#
+# Запуск (CfC — первым, чтобы потом взять его backbone для Transformer):
+#   python train.py --config configs/retinex_cfc_bvirlv_stage5_sanity.yaml \
+#       --wall-clock-limit-sec 3600 --checkpoint-every-sec 300
+
+model:
+  n_feat: 32
+  stage: 1
+  num_blocks: [1, 1, 1]
+  window_size: 5
+  hidden_dim: 64
+  n_neurons: 32
+  fps: 25.0
+  freeze_backbone: true      # trainable: 749k → 23k (та же схема, что в основном diagnostic-прогоне)
+  backbone_lr_scale: 0.1
+
+dataset:
+  name: bvi_rlv
+  # Только Part 1 — все 3 сцены sanity-check лежат в S02-S11.
+  data_root:
+    - /kaggle/input/bvi-rlv-low-light-video-dataset-20-scene-subset
+  # 3 сцены вместо всего датасета (Этап 5 acceptance: "маленькая подвыборка,
+  # 2-3 сцены"). Выбраны по разнообразию названий (не по количественной
+  # оценке движения — это не проверялось визуально заранее).
+  scenes:
+    - S02_animals1
+    - S06_lego
+    - S11_gift_wrap
+  # flow_root: Этап 4 motion alignment. Каждая сцена — отдельный per-scene
+  # Kaggle-датасет (scripts/precompute_flow.py --archive-and-upload), нужно
+  # подключить все три к ноутбуку (Add Input) ПЕРЕД запуском.
+  flow_root:
+    - /kaggle/input/bvi-rlv-flow-s02-animals1
+    - /kaggle/input/bvi-rlv-flow-s06-lego
+    - /kaggle/input/bvi-rlv-flow-s11-gift-wrap
+  # importance_scale: эвристика разрешения коллизий в splat-инверсии
+  # (data/motion_alignment.py). НЕ откалибрована на реальных данных —
+  # открытый вопрос в mempalace. Стоит визуально сверить occlusion-маску
+  # на этом прогоне перед Этапом 6.
+  importance_scale: 1.0
+  patch_size: 256
+  window_size: 5
+  fps: 25.0
+  train_ratio: 0.85   # при 3 сценах: 2 в train, 1 в val
+  seed: 42
+
+train:
+  batch_size: 4
+  num_workers: 4
+  epochs: 5            # sanity-check, не полный прогон — важен тренд, не сходимость
+  lr: 0.0002
+  lr_min: 0.000001
+  warmup_epochs: 1
+  save_every: 1
+  val_every: 1
+  finetune_epoch: 999  # выключено для sanity-check (backbone остаётся замороженным)
+
+loss:
+  lambda_pixel: 1.0
+  lambda_ssim: 0.1
+  lambda_temporal: 0.05
+
+paths:
+  checkpoints: /kaggle/working/experiments/checkpoints/cfc_bvirlv_stage5_sanity
+  logs: /kaggle/working/experiments/logs/cfc_bvirlv_stage5_sanity
+  results: /kaggle/working/experiments/results/cfc_bvirlv_stage5_sanity
