@@ -17,10 +17,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
+from torch.utils.data import DataLoader
 
 from data.datasets import BVIRLVDataset, load_image
 from losses.combined_loss import CombinedLoss
+import train as train_module
 
 GREEN, RED, YELLOW, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[0m"
 
@@ -264,6 +267,69 @@ def test_scene_exclusion_when_flow_missing(root):
           raised)
 
 
+class _DummyModel(nn.Module):
+    """Минимальная модель с интерфейсом RetinexLNNPipeline (return_prev),
+    достаточная, чтобы прогнать train.train_epoch/validate целиком, не
+    затрагивая реальный backbone/CfC/Transformer (не входит в scope этого ТЗ,
+    см. правило 1 в TZ_motion_alignment_LNN_LowLight.md)."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, frames, timespans=None, return_prev=False):
+        pred = frames[:, -1] * self.scale
+        if return_prev:
+            enhanced_prev = frames[:, -2] * self.scale
+            return pred, enhanced_prev
+        return pred
+
+    def get_num_params(self):
+        return {'total': 1, 'trainable': 1, 'temporal': 1}
+
+
+class _SpyCriterion:
+    """Оборачивает CombinedLoss и запоминает, каким occlusion её реально
+    вызвали train_epoch/validate — проверяет саму проводку, а не только то,
+    что CombinedLoss умеет принимать occlusion в изоляции (Тест 4)."""
+
+    def __init__(self):
+        self.inner = CombinedLoss()
+        self.received = []
+
+    def __call__(self, *args, **kwargs):
+        self.received.append(kwargs.get('occlusion'))
+        return self.inner(*args, **kwargs)
+
+
+def test_train_loop_wires_occlusion(data_root, flow_root):
+    info("Тест 9: train.train_epoch/validate реально прокидывают occlusion в CombinedLoss")
+    ds = BVIRLVDataset(
+        data_root=str(data_root), split='train', window_size=5, patch_size=0,
+        augment=False, train_ratio=1.0, flow_root=str(flow_root),
+    )
+    loader = DataLoader(ds, batch_size=2, shuffle=False)
+    model = _DummyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    spy = _SpyCriterion()
+
+    metrics, interrupted = train_module.train_epoch(
+        model, loader, optimizer, spy, device=torch.device('cpu'), epoch=0,
+    )
+    check("train_epoch не упал и не был прерван", not interrupted)
+    check("train_epoch реально вызвал criterion хотя бы раз", len(spy.received) > 0)
+    check("occlusion, дошедший до criterion в train_epoch, не None",
+          all(o is not None for o in spy.received))
+    check("occlusion, дошедший до criterion в train_epoch, не всегда нулевой (реально что-то замаскировано)",
+          any(o.sum().item() > 0 for o in spy.received))
+
+    spy_val = _SpyCriterion()
+    val_metrics = train_module.validate(model, loader, spy_val, device=torch.device('cpu'))
+    check("validate() тоже реально вызвал criterion", len(spy_val.received) > 0)
+    check("occlusion, дошедший до criterion в validate(), не None",
+          all(o is not None for o in spy_val.received))
+
+
 if __name__ == "__main__":
     tmp_root = Path(tempfile.mkdtemp(prefix="lnn_lowlight_stage4_"))
     try:
@@ -276,6 +342,7 @@ if __name__ == "__main__":
         test_dataset_with_flow_and_augment(data_root, flow_root)
         test_combined_loss_with_occlusion()
         test_warp_geometric_correctness(data_root, flow_root)
+        test_train_loop_wires_occlusion(data_root, flow_root)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

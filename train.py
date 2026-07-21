@@ -191,6 +191,14 @@ def train_epoch(
         timespans = batch.get('timespans')
         if timespans is not None:
             timespans = timespans.to(device, non_blocking=True)
+        # occlusion (Этап 4 motion alignment): [B,1,H,W], 1=не доверять
+        # пикселю (splat-инверсия/дыры при выравнивании окна к anchor).
+        # Присутствует всегда (BVIRLVDataset без flow_root возвращает нули),
+        # так что .get здесь — просто защита для датасетов без этого поля
+        # (LOL/SDSD), а не признак того, что маска опциональна при её наличии.
+        occlusion = batch.get('occlusion')
+        if occlusion is not None:
+            occlusion = occlusion.to(device, non_blocking=True)
 
         # return_prev=True запрашивает у модели enhanced-выход для
         # предпоследнего (T-2) кадра окна — без него CombinedLoss никогда
@@ -213,6 +221,7 @@ def train_epoch(
         losses = criterion(
             pred, target,
             enhanced_prev=enhanced_prev, low_prev=low_prev, low_curr=low_curr,
+            occlusion=occlusion,
         )
         optimizer.zero_grad()
         losses['total'].backward()
@@ -272,8 +281,11 @@ def validate(model, loader, criterion, device):
         timespans = batch.get('timespans')
         if timespans is not None:
             timespans = timespans.to(device, non_blocking=True)
+        occlusion = batch.get('occlusion')
+        if occlusion is not None:
+            occlusion = occlusion.to(device, non_blocking=True)
         pred   = model(frames, timespans).clamp(0., 1.)
-        losses = criterion(pred, target)
+        losses = criterion(pred, target, occlusion=occlusion)
         total_loss += losses['total'].item()
         mse  = ((pred - target) ** 2).mean(dim=[1, 2, 3])
         psnr = (-10 * torch.log10(mse + 1e-8)).mean().item()
