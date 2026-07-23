@@ -202,7 +202,7 @@ class BVIRLVDataset(Dataset):
     data_root может быть одним путём (str) или списком путей (list[str]) — второе
     используется, когда сцены разбиты по нескольким Kaggle-датасетам (например,
     подключены и -20-scene-subset, и -part-2 к одному ноутбуку) — все сцены со всех
-    указанных каталогов объединяются в один пул до train/test сплита.
+    указанных каталогов объединяются в один пул сцен до train/test сплита.
 
     npy_cache_root (опционально): путь к корневой директории с .npy-кэшем.
     Если задан — используется load_image_with_npy_cache():
@@ -234,7 +234,7 @@ class BVIRLVDataset(Dataset):
       frames:    [T, 3, H, W]  — окно из T low-light кадров (выровненных к
                                  последнему кадру, если flow_root задан)
       target:    [3, H, W]     — GT текущего кадра
-      timespans: [T]           — ∆t = 1/fps
+      timespans: [T]           — ∆t между кадрами; см. use_physical_dt ниже
       occlusion: [1, H, W]     — 1 = пикселю нельзя доверять (occlusion
                                  motion alignment); все нули, если flow_root
                                  не задан или для этой сцены flow не найден
@@ -311,6 +311,7 @@ class BVIRLVDataset(Dataset):
         flow_root=None,
         importance_scale: float = 1.0,
         scenes=None,
+        use_physical_dt: bool = False,
     ):
         """
         data_root: путь к папке с сценами (str) ЛИБО список таких путей (list[str]).
@@ -334,12 +335,24 @@ class BVIRLVDataset(Dataset):
         на маленькой подвыборке (Этап 5 ТЗ motion alignment: 2-3 сцены вместо
         всего датасета). Если None (по умолчанию) — используются все сцены,
         найденные в data_root(s), как раньше.
+
+        use_physical_dt: если False (по умолчанию) — timespans, отдаваемые
+        для CfC, равны 1.0 на шаг (безразмерный "номер шага", как неявно
+        использует Transformer через positional embedding), а не реальным
+        секундам 1/fps. Диагностика Этапа 5 sanity-check (2026-07-23,
+        mempalace wing=LNN_LowLight decisions): CfC получал timespans=1/fps
+        (0.04с при fps=25) без калибровки временных констант AutoNCP-wiring
+        под этот масштаб — подозрение, что сеть стартовала в вырожденном
+        режиме, близком к identity (см. mempalace). Если True — возвращает
+        реальные timespans=1/fps, как было до этого изменения (для будущих
+        экспериментов с откалиброванным физическим временем).
         """
         super().__init__()
         self.window_size = window_size
         self.patch_size  = patch_size
         self.augment     = augment and (split == 'train')
         self.dt          = 1.0 / fps
+        self.use_physical_dt = use_physical_dt
         self.npy_cache_root = Path(npy_cache_root) if npy_cache_root is not None else None
         self.importance_scale = importance_scale
 
@@ -576,7 +589,10 @@ class BVIRLVDataset(Dataset):
                 occlusion = occlusion[:, top:top + ps, left:left + ps]
 
         frames_t   = torch.stack(frames, dim=0)
-        timespans  = torch.full((self.window_size,), self.dt)
+        timespans  = torch.full(
+            (self.window_size,),
+            self.dt if self.use_physical_dt else 1.0,
+        )
         frame_name = lq_paths[-1].stem                 # 00005
         return {
             'frames':    frames_t,
@@ -769,6 +785,7 @@ def build_dataset(cfg: dict, split: str):
             flow_root=cfg.get('flow_root'),
             importance_scale=cfg.get('importance_scale', 1.0),
             scenes=cfg.get('scenes'),
+            use_physical_dt=cfg.get('use_physical_dt', False),
         )
     elif name == 'sdsd':
         return SDSDDataset(
