@@ -1,0 +1,106 @@
+"""
+Baseline'ы для сравнения с CfC-B (ТЗ §4) — 4 конфигурации, по 2 версии на 2 семейства.
+
+Faithful vs честная версия разводит два разных вопроса (см. ТЗ §4): (а) помогает ли вообще
+доступ к Δt/staleness-информации, (б) даёт ли именно CfC-формулировка преимущество СВЕРХ
+простого доступа к той же информации. Faithful воспроизводит то, как реально устроен
+NRD/NRC в проде (без знания о Δt/staleness); честная версия — тот же механизм + равный
+CfC-B доступ к информации.
+
+Сознательно НЕ повторяется инженерная сложность продакшн-версий (variance-based clamping
+в NRD, полный online-distillation цикл NRC на GPU) — не меняет алгоритмический вопрос,
+который тестирует sanity-check этапа-1 (§1.3/§7.7).
+"""
+
+import torch
+import torch.nn as nn
+
+
+class NRDStyleBaseline(nn.Module):
+    """
+    Hand-crafted exponential accumulation (аналог NVIDIA NRD/ReBLUR/RELAX) — БЕЗ нейросети
+    во temporal-части, поэтому нет обучаемых параметров: alpha/tau — фиксированные
+    гиперпараметры (как и в реальном NRD, где decay задаётся вручную/эвристикой, не обучением).
+
+    faithful (use_honest_dt=False): out_t = out_{t-1}*(1-alpha) + obs_t*alpha, alpha ФИКСИРОВАН,
+        Δt игнорируется вообще (как в реальном NRD, рассчитанном на стабильный fps).
+    честная версия (use_honest_dt=True): alpha_t = 1 - exp(-dt_t/tau) — continuous-time
+        аналог EMA, даёт baseline'у ту же информацию о времени, что видит CfC.
+    """
+
+    def __init__(self, alpha: float = 0.3, tau: float = 3.0, use_honest_dt: bool = False):
+        super().__init__()
+        self.alpha = alpha
+        self.tau = tau
+        self.use_honest_dt = use_honest_dt
+
+    def forward(self, obs_seq: torch.Tensor, dt_seq: torch.Tensor) -> torch.Tensor:
+        """
+        obs_seq: [B, T, obs_dim]
+        dt_seq:  [B, T] или [B, T, 1] — используется только если use_honest_dt=True
+        Returns: pred_seq [B, T, obs_dim]
+        """
+        if dt_seq.dim() == 2:
+            dt_seq = dt_seq.unsqueeze(-1)  # [B, T, 1]
+
+        B, T, _ = obs_seq.shape
+        out = obs_seq[:, 0]  # cold-start: первое наблюдение как есть (нет истории)
+        outputs = [out]
+        for t in range(1, T):
+            if self.use_honest_dt:
+                a = 1.0 - torch.exp(-dt_seq[:, t] / self.tau)  # [B, 1]
+            else:
+                a = self.alpha
+            out = out * (1.0 - a) + obs_seq[:, t] * a
+            outputs.append(out)
+        return torch.stack(outputs, dim=1)
+
+
+class NRCStyleBaseline(nn.Module):
+    """
+    Online per-scene per-frame MLP (аналог NVIDIA NRC / AMD FSR Radiance Cache) — БЕЗ
+    рекуррентности: каждый шаг обрабатывается независимо тем же MLP (как в оригинальном
+    NRC, где каждый query — независимый forward-pass, а обучение online происходит по
+    накопленной статистике сцены, а не через carried-over hidden state между кадрами).
+
+    faithful (use_staleness=False): вход = только obs, как в оригинальном NRC.
+    честная версия (use_staleness=True): вход = obs + [cold_start, confidence], как у CfC-B
+        (§2.2) — тот же staleness-вектор, тот же источник (log1p(spp) нормализованный).
+    """
+
+    def __init__(self, obs_dim: int = 1, hidden_dim: int = 32, use_staleness: bool = False):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.use_staleness = use_staleness
+        input_dim = obs_dim + (2 if use_staleness else 0)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, obs_dim),
+        )
+
+    @staticmethod
+    def build_input(
+        obs: torch.Tensor,
+        cold_start: torch.Tensor | None = None,
+        confidence: torch.Tensor | None = None,
+        use_staleness: bool = False,
+    ) -> torch.Tensor:
+        """Тот же формат входа, что CfCProbeModule.build_input (§3.1/§3.2) — для честного
+        сравнения оба baseline'а и CfC-B видят идентично собранный staleness-вектор."""
+        if not use_staleness:
+            return obs
+        if cold_start is None or confidence is None:
+            raise ValueError("use_staleness=True требует cold_start и confidence")
+        staleness = torch.stack([cold_start, confidence], dim=-1)
+        return torch.cat([obs, staleness], dim=-1)
+
+    def forward(self, u_seq: torch.Tensor) -> torch.Tensor:
+        """
+        u_seq: [B, T, input_dim] (см. build_input)
+        Returns: pred_seq [B, T, obs_dim] — каждый шаг обработан НЕЗАВИСИМО, без
+                 рекуррентности (архитектурное отличие от CfC-B/GRU-baseline'ов).
+        """
+        return self.mlp(u_seq)
