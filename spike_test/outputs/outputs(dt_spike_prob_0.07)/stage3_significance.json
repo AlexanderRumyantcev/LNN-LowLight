@@ -1,0 +1,34 @@
+{
+  "CfC-A_vs_GRU-control": {
+    "mean_diff": 0.0021267515272857286,
+    "ci95": [
+      -0.017770576656748277,
+      0.022312961682641446
+    ],
+    "significant": false
+  },
+  "CfC-B_vs_GRU-B": {
+    "mean_diff": -0.007001093606679485,
+    "ci95": [
+      -0.017714744328539103,
+      0.004188085693674962
+    ],
+    "significant": false
+  },
+  "ODE-event-B_vs_CfC-B_earlyzone": {
+    "mean_diff": -0.203817421839071,
+    "ci95": [
+      -0.32012376000273385,
+      -0.10084132791880389
+    ],
+    "significant": true
+  },
+  "ODE-event-B_vs_GRU-B_earlyzone": {
+    "mean_diff": -0.42149133514015913,
+    "ci95": [
+      -0.5561518298931426,
+      -0.29424126358293834
+    ],
+    "significant": true
+  }
+}
