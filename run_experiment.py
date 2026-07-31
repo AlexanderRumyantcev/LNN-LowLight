@@ -1,8 +1,9 @@
 """
 Единый скрипт этапа-1 (ТЗ §1.3 sanity-check): генерация synthetic-сцен → обучение CfC-B +
 обучаемых baseline'ов (NRC-style) + прямое применение необучаемых baseline'ов (NRD-style) →
-evaluation по §6 (per-segment-type, early-zone/floor) → paired bootstrap значимость (§5.2/§6.4)
-против ЧЕСТНЫХ версий baseline'ов.
+evaluation по §6 (per-segment-type, error-vs-offset, early-zone/floor) → paired bootstrap
+значимость (§5.2/§6.4) против ЧЕСТНЫХ версий baseline'ов — как по early-zone (агрегат),
+так и по каждому типу сегмента отдельно (§6.3).
 
 Рассчитан на запуск на Kaggle GPU (локальная машина — MacBook Air M1, без CUDA): пуш этого
 репозитория на GitHub → в Kaggle-ноутбуке git clone → python run_experiment.py.
@@ -18,6 +19,17 @@ evaluation по §6 (per-segment-type, early-zone/floor) → paired bootstrap з
 Loss для ВСЕХ обучаемых моделей — одинаковый, БЕЗ confidence-weighting (§5.1: confidence-
 weighting — опциональное расширение, не часть базового loss; одинаковый loss для CfC и
 NRC-baseline делает сравнение чистым, см. §5.1/§4).
+
+РАСШИРЕНИЕ ОТЧЁТА (2026-07-31, по итогам первого sanity-прогона): агрегированные early/floor
+маскируют структуру (тот же урок, что уже был на run_v3 spike-теста, см. §6.1) — агрегат не
+даёт ответить на вопрос "ГДЕ именно CfC-B работает/не работает", только "лучше/хуже В СРЕДНЕМ".
+Добавлены:
+    - per_segment_type_mse (§6.3) — static/step/drift раздельно, а не одно число;
+    - error_vs_offset_curve (§6.1) — ОСНОВНАЯ метрика по ТЗ, MSE по бинам offset-с-момента-
+      скачка внутри STEP-сегментов; агрегат по early/floor — производная от неё, не наоборот;
+    - paired bootstrap значимость (§5.2/§6.4) ПОВТОРЕНА для каждого типа сегмента отдельно
+      (не только для early-zone), чтобы увидеть, отличается ли вывод "CfC не выигрывает"
+      в зависимости от типа динамики (static/step/drift), а не только усреднённо.
 """
 
 import argparse
@@ -31,9 +43,13 @@ from models.temporal.cfc_probe_module import CfCProbeModule
 from models.baselines import NRDStyleBaseline, NRCStyleBaseline
 from models.losses import NRCRelativeL2Loss
 from evaluation.metrics import (
-    label_samples, early_zone_floor_split, per_segment_type_mse,
-    paired_bootstrap_significance, MIN_N_SEEDS,
+    label_samples, early_zone_floor_split, per_segment_type_mse, error_vs_offset_curve,
+    paired_bootstrap_significance, MIN_N_SEEDS, SEGMENT_NAMES,
 )
+
+BIN_EDGES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 20, np.inf])
+BIN_LABELS = [f"[{BIN_EDGES[i]:g},{BIN_EDGES[i+1]:g})" for i in range(len(BIN_EDGES) - 1)]
+SEGMENT_TYPE_NAMES = list(SEGMENT_NAMES.values())  # ["static", "step", "drift"]
 
 
 def build_batch(seqs, indices):
@@ -118,6 +134,10 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
     model_kinds = ["cfc", "nrd_faithful", "nrd_honest", "nrc_faithful", "nrc_honest"]
     early_by_kind = {k: [] for k in model_kinds}
     floor_by_kind = {k: [] for k in model_kinds}
+    # §6.3 — MSE по типу сегмента (static/step/drift), отдельный список ПО СИДАМ на каждый kind/тип
+    segtype_by_kind = {k: {name: [] for name in SEGMENT_TYPE_NAMES} for k in model_kinds}
+    # §6.1 — error-vs-offset-since-jump кривая (только STEP), список ПО СИДАМ на каждый kind/бин
+    curve_by_kind = {k: {label: [] for label in BIN_LABELS} for k in model_kinds}
 
     for seed in range(n_seeds):
         cfg = SceneGenConfig(n_probes=n_probes, seed=seed)
@@ -145,36 +165,92 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
         true = eval_batch["true"].numpy()
         t_arr = eval_batch["t"]
 
+        # seg_type/offset не зависят от kind — считаем один раз на пробу, не на каждый kind
+        seg_offset_per_probe = [
+            label_samples(t_arr[p].astype(np.float64), scene["light_schedule"])
+            for p in range(len(eval_idx))
+        ]
+
         for kind in model_kinds:
             early_vals, floor_vals = [], []
+            seg_mse_accum = {name: [] for name in SEGMENT_TYPE_NAMES}
+            curve_accum = {label: [] for label in BIN_LABELS}
+
             for p in range(len(eval_idx)):
-                seg_type, offset = label_samples(t_arr[p].astype(np.float64), scene["light_schedule"])
-                e, f = early_zone_floor_split(
-                    preds[kind][p, :, 0].astype(np.float64), true[p, :, 0].astype(np.float64),
-                    seg_type, offset,
-                )
+                seg_type, offset = seg_offset_per_probe[p]
+                pred_p = preds[kind][p, :, 0].astype(np.float64)
+                true_p = true[p, :, 0].astype(np.float64)
+
+                e, f = early_zone_floor_split(pred_p, true_p, seg_type, offset)
                 if not np.isnan(e):
                     early_vals.append(e)
                 if not np.isnan(f):
                     floor_vals.append(f)
+
+                seg_mse = per_segment_type_mse(pred_p, true_p, seg_type)
+                for name, val in seg_mse.items():
+                    if not np.isnan(val):
+                        seg_mse_accum[name].append(val)
+
+                curve = error_vs_offset_curve(pred_p, true_p, seg_type, offset, bin_edges=BIN_EDGES)
+                for label, val in curve.items():
+                    if not np.isnan(val):
+                        curve_accum[label].append(val)
+
             early_by_kind[kind].append(float(np.mean(early_vals)) if early_vals else float("nan"))
             floor_by_kind[kind].append(float(np.mean(floor_vals)) if floor_vals else float("nan"))
+            for name in SEGMENT_TYPE_NAMES:
+                vals = seg_mse_accum[name]
+                segtype_by_kind[kind][name].append(float(np.mean(vals)) if vals else float("nan"))
+            for label in BIN_LABELS:
+                vals = curve_accum[label]
+                curve_by_kind[kind][label].append(float(np.mean(vals)) if vals else float("nan"))
 
         print(f"seed {seed}: early(cfc)={early_by_kind['cfc'][-1]:.4f} floor(cfc)={floor_by_kind['cfc'][-1]:.4f}")
 
-    print("\n=== summary (mean over seeds) ===")
+    print("\n=== summary (mean over seeds): early / floor ===")
     for kind in model_kinds:
         print(f"{kind:14s}  early={np.nanmean(early_by_kind[kind]):.4f}  floor={np.nanmean(floor_by_kind[kind]):.4f}")
 
-    print("\n=== §5.2 критерий: CfC-B vs честные baseline'ы (paired bootstrap, early-zone) ===")
+    print("\n=== §6.3 summary (mean over seeds): per-segment-type MSE (static / step / drift) ===")
+    for kind in model_kinds:
+        vals = [np.nanmean(segtype_by_kind[kind][name]) for name in SEGMENT_TYPE_NAMES]
+        row = "  ".join(f"{name}={v:.4f}" for name, v in zip(SEGMENT_TYPE_NAMES, vals))
+        print(f"{kind:14s}  {row}")
+
+    print("\n=== §6.1 summary (mean over seeds): error-vs-offset-since-jump (STEP-сегменты, основная метрика) ===")
+    header = "kind".ljust(14) + "".join(lbl.rjust(11) for lbl in BIN_LABELS)
+    print(header)
+    for kind in model_kinds:
+        row = kind.ljust(14)
+        for label in BIN_LABELS:
+            val = np.nanmean(curve_by_kind[kind][label])
+            row += f"{val:11.4f}" if not np.isnan(val) else f"{'nan':>11s}"
+        print(row)
+
+    print("\n=== §5.2 критерий: CfC-B vs честные baseline'ы (paired bootstrap, early-zone, агрегат) ===")
     for honest_kind in ["nrd_honest", "nrc_honest"]:
         res = paired_bootstrap_significance(
             np.array(early_by_kind["cfc"]), np.array(early_by_kind[honest_kind]),
         )
-        print(f"cfc vs {honest_kind}: mean_diff={res['mean_diff']:.4f} "
+        print(f"cfc vs {honest_kind} (early-zone): mean_diff={res['mean_diff']:.4f} "
               f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
 
-    return early_by_kind, floor_by_kind
+    print("\n=== §6.3 доп. значимость: CfC-B vs честные baseline'ы, ОТДЕЛЬНО ПО ТИПАМ СЕГМЕНТОВ ===")
+    print("(тот же paired bootstrap §6.4, но НЕ агрегат — чтобы увидеть, меняется ли вывод")
+    print(" в зависимости от типа динамики; NaN у части сидов для сегмента -> пропуск с пометкой)")
+    for seg_name in SEGMENT_TYPE_NAMES:
+        for honest_kind in ["nrd_honest", "nrc_honest"]:
+            a = np.array(segtype_by_kind["cfc"][seg_name])
+            b = np.array(segtype_by_kind[honest_kind][seg_name])
+            if np.isnan(a).any() or np.isnan(b).any():
+                print(f"cfc vs {honest_kind} ({seg_name}): пропущено — сегмент не встретился хотя бы в одном сиде")
+                continue
+            res = paired_bootstrap_significance(a, b)
+            print(f"cfc vs {honest_kind} ({seg_name}): mean_diff={res['mean_diff']:.4f} "
+                  f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    return early_by_kind, floor_by_kind, segtype_by_kind, curve_by_kind
 
 
 if __name__ == "__main__":
