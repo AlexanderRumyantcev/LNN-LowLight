@@ -51,6 +51,7 @@ class CfCProbeCell(nn.Module):
         self.W_a = nn.Linear(hidden_dim, hidden_dim)  # множитель на dt
         self.W_b = nn.Linear(hidden_dim, hidden_dim)  # смещение
         self.last_sigma_tau: torch.Tensor | None = None  # диагностика saturation гейта
+        self.last_gate_diag: dict | None = None  # z, t_a, t_b, pre_sigmoid, sigma_tau — см. full_gate_diagnostics()
 
     def forward(
         self,
@@ -68,8 +69,12 @@ class CfCProbeCell(nn.Module):
         h_cand = torch.tanh(self.W_h(z))
         t_a = self.W_a(z)
         t_b = self.W_b(z)
-        sigma_tau = torch.sigmoid(t_a * dt_t + t_b)
+        pre_sigmoid = t_a * dt_t + t_b
+        sigma_tau = torch.sigmoid(pre_sigmoid)
         self.last_sigma_tau = sigma_tau.detach()
+        # без detach — full_gate_diagnostics делает backward через t_a/t_b, чтобы проверить
+        # доходит ли до W_a/W_b полезный градиент
+        self.last_gate_diag = dict(z=z, t_a=t_a, t_b=t_b, pre_sigmoid=pre_sigmoid, sigma_tau=sigma_tau)
         return h_cand * sigma_tau + g * (1.0 - sigma_tau)
 
 
@@ -168,13 +173,120 @@ class CfCProbeModule(nn.Module):
 
         outputs = []
         gate_log = [] if record_gates else None
+        diag_logs = {k: [] for k in ("z", "t_a", "t_b", "pre_sigmoid", "sigma_tau")} if record_gates else None
         for t in range(T):
             h = self.cell(u_seq[:, t], h, dt_seq[:, t])
             if record_gates:
                 gate_log.append(self.cell.last_sigma_tau)
+                for k in diag_logs:
+                    diag_logs[k].append(self.cell.last_gate_diag[k])
             outputs.append(self.readout(h))
 
         if record_gates:
             self.last_gate_log = torch.stack(gate_log, dim=1)  # [B, T, hidden_dim]
+            # каждый ключ — [B, T, hidden_dim]; держит граф, если вызывающий код не под no_grad()
+            # (нужно full_gate_diagnostics для backward через t_a/t_b)
+            self.last_diag_log = {k: torch.stack(v, dim=1) for k, v in diag_logs.items()}
 
         return torch.stack(outputs, dim=1), h
+
+
+# ---------------------------------------------------------------------------
+# Комплексная gate-диагностика (2026-08-01) — ВСЕ метрики за один проход, вместо проверки по
+# одной. Портирована из spike_test/models/models.py::full_gate_diagnostics на формат этого
+# production-модуля (u_seq/dt_seq вместо features/tau). Отвечает на вопрос: если σ_τ зажат в
+# узком диапазоне, это (а) W_a/W_b не получают полезный градиент, или (б) z (выход backbone) сам
+# не варьируется между staleness/dt-паттернами настолько, чтобы "пробить" W_a/W_b.
+# ---------------------------------------------------------------------------
+def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: torch.Tensor,
+                           true: torch.Tensor = None, seg_type: "np.ndarray" = None,
+                           segment_names: dict | None = None, label: str = "sigma_tau",
+                           verbose: bool = True) -> dict:
+    """
+    Один проход даёт срез сразу по всем гипотезам:
+      - saturation sigma_tau (как в predict_cfc_with_gates)
+      - pre_sigmoid = t_a*dt + t_b — ДО сжатия сигмоидой
+      - t_a = W_a(z) и t_b = W_b(z) — отдельно друг от друга и от dt
+      - z (выход backbone) — общая статистика + разбивка по seg_type (static/step/drift), если
+        передан. Если z почти не отличается между сегментами — backbone не различает паттерны,
+        через которые ДОЛЖЕН идти staleness-сигнал.
+      - если передан `true` — градиентная норма W_a.weight/bias и W_b.weight/bias после ОДНОГО
+        backward (не эпохи обучения; MSE-loss для диагностики, не обязательно loss обучения).
+
+    u_seq: [B, T, input_dim], dt_seq: [B, T] или [B, T, 1], true: [B, T, obs_dim] опционально.
+    seg_type: [B, T] int-коды сегментов (см. evaluation.metrics.SEGMENT_NAMES), опционально.
+    """
+    import numpy as np  # локальный импорт — модуль не тянет numpy на верхнем уровне
+
+    model.zero_grad(set_to_none=True)
+    grad_info = {}
+    if true is not None:
+        pred, _ = model(u_seq, dt_seq, record_gates=True)
+        diag = model.last_diag_log
+        loss = ((pred - true) ** 2).mean()
+        loss.backward()
+        for name in ("W_a", "W_b"):
+            layer = getattr(model.cell, name)
+            w_grad, b_grad = layer.weight.grad, layer.bias.grad
+            grad_info[name] = dict(
+                weight_grad_norm=float(w_grad.norm().item()) if w_grad is not None else None,
+                bias_grad_norm=float(b_grad.norm().item()) if b_grad is not None else None,
+            )
+        model.zero_grad(set_to_none=True)
+        diag = {k: v.detach() for k, v in diag.items()}
+    else:
+        with torch.no_grad():
+            model(u_seq, dt_seq, record_gates=True)
+            diag = model.last_diag_log
+
+    def stats(t):
+        t = t.detach()
+        return dict(mean=float(t.mean()), std=float(t.std()), min=float(t.min()), max=float(t.max()))
+
+    z, t_a, t_b, pre_sig, sig_tau = diag["z"], diag["t_a"], diag["t_b"], diag["pre_sigmoid"], diag["sigma_tau"]
+
+    result = {
+        "sigma_tau": {**stats(sig_tau),
+                      "sat_low(<0.02)": float((sig_tau < 0.02).float().mean()),
+                      "sat_high(>0.98)": float((sig_tau > 0.98).float().mean())},
+        "pre_sigmoid(t_a*dt+t_b)": stats(pre_sig),
+        "t_a=W_a(z)": stats(t_a),
+        "t_b=W_b(z)": stats(t_b),
+        "z(backbone_out)": stats(z),
+        "z_per_dim_std_mean": float(z.std(dim=(0, 1)).mean()),
+        "grad": grad_info,
+    }
+
+    if seg_type is not None:
+        seg_t = torch.as_tensor(seg_type)
+        names = segment_names or {0: "static", 1: "step", 2: "drift"}
+        by_seg = {}
+        for code, name in names.items():
+            mask = seg_t == code
+            if mask.any():
+                by_seg[name] = dict(z_norm_mean=float(z[mask].norm(dim=-1).mean()),
+                                     t_a_mean=float(t_a[mask].mean()), t_b_mean=float(t_b[mask].mean()))
+        result["by_seg_type"] = by_seg
+
+    if verbose:
+        print(f"    [full-gate-diag] {label}")
+        st = result["sigma_tau"]
+        print(f"      sigma_tau:      mean={st['mean']:.3f} std={st['std']:.3f} "
+              f"sat_low={st['sat_low(<0.02)']:.1%} sat_high={st['sat_high(>0.98)']:.1%}")
+        ps = result["pre_sigmoid(t_a*dt+t_b)"]
+        print(f"      pre-sigmoid:    mean={ps['mean']:.3f} std={ps['std']:.3f} range=[{ps['min']:.3f}, {ps['max']:.3f}]")
+        ta, tb = result["t_a=W_a(z)"], result["t_b=W_b(z)"]
+        print(f"      t_a=W_a(z):     mean={ta['mean']:.3f} std={ta['std']:.3f} range=[{ta['min']:.3f}, {ta['max']:.3f}]")
+        print(f"      t_b=W_b(z):     mean={tb['mean']:.3f} std={tb['std']:.3f} range=[{tb['min']:.3f}, {tb['max']:.3f}]")
+        zz = result["z(backbone_out)"]
+        print(f"      z(backbone):    mean={zz['mean']:.3f} std={zz['std']:.3f} per_dim_std_mean={result['z_per_dim_std_mean']:.4f}")
+        if grad_info:
+            for name, gi in grad_info.items():
+                wn, bn = gi['weight_grad_norm'], gi['bias_grad_norm']
+                print(f"      grad[{name}]:    weight_norm={wn:.5f} bias_norm={bn:.5f}" if wn is not None
+                      else f"      grad[{name}]:    None (нет градиента)")
+        if "by_seg_type" in result:
+            for seg, s in result["by_seg_type"].items():
+                print(f"      seg={seg:7s}     z_norm={s['z_norm_mean']:.3f} t_a={s['t_a_mean']:.3f} t_b={s['t_b_mean']:.3f}")
+
+    return result

@@ -39,7 +39,7 @@ import numpy as np
 import torch
 
 from data.synthetic_probe_scene import SceneGenConfig, generate_scene, sample_probe_sequence, SEG_STEP
-from models.temporal.cfc_probe_module import CfCProbeModule
+from models.temporal.cfc_probe_module import CfCProbeModule, full_gate_diagnostics
 from models.baselines import NRDStyleBaseline, NRCStyleBaseline
 from models.losses import NRCRelativeL2Loss
 from evaluation.metrics import (
@@ -202,6 +202,25 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
         cfc_model = train_model("cfc", train_batch, device, epochs, lr, hidden_dim)
         nrc_f_model = train_model("nrc_faithful", train_batch, device, epochs, lr, hidden_dim)
         nrc_h_model = train_model("nrc_honest", train_batch, device, epochs, lr, hidden_dim)
+
+        # ПОЛНАЯ gate-диагностика (2026-08-01, за ОДИН проход вместо проверки по одной метрике):
+        # pre-sigmoid, W_a(z)/W_b(z) отдельно, z по seg_type, градиентные нормы W_a/W_b —
+        # на TRAIN-данных (не eval), т.к. градиентная проверка должна идти на том, что модель
+        # реально видела при обучении. См. models/temporal/cfc_probe_module.py::full_gate_diagnostics.
+        train_seg_type = np.stack([
+            label_samples(train_batch["t"][i].astype(np.float64), scene["light_schedule"])[0]
+            for i in range(len(train_idx))
+        ])
+        u_train = cfc_model.build_input(
+            train_batch["obs"].to(device), train_batch["cold"].to(device),
+            train_batch["conf"].to(device), use_staleness=True,
+        )
+        full_gate_diagnostics(
+            cfc_model, u_train, train_batch["dt"].to(device), true=train_batch["true"].to(device),
+            seg_type=train_seg_type, segment_names=SEGMENT_NAMES,
+            label=f"seed={seed} (train)",
+        )
+
 
         cfc_pred, cfc_gate_mean = predict_cfc_with_gates(cfc_model, eval_batch, device)
         preds = {
