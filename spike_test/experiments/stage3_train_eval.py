@@ -12,7 +12,7 @@ import torch.nn as nn
 from data.synthetic import generate_dataset, make_train_test_configs
 from models.models import (
     CfCSequenceModel, GRUBaseline, NeuralODEEventModel, build_features,
-    ema_baseline, precision_weighted_baseline,
+    ema_baseline, precision_weighted_baseline, full_gate_diagnostics,
 )
 
 DEVICE = "cpu"
@@ -46,16 +46,22 @@ def train_torch_model(model_ctor, feature_mode, train_seqs, seed, epochs=60, bat
         if (epoch + 1) % 20 == 0:
             print(f"    epoch {epoch+1}/{epochs} loss={total_loss/N:.4f}")
 
-    # ДИАГНОСТИКА (ТЗ Приложение А.3): saturation time-gate / event-prob на трейне — отличить
-    # "архитектура плоха" от "гейт насытился и градиент не идёт".
-    if isinstance(model, (CfCSequenceModel, NeuralODEEventModel)):
+    # ДИАГНОСТИКА (ТЗ Приложение А.3 + расширение 2026-08-01): saturation time-gate / event-prob
+    # на трейне — отличить "архитектура плоха" от "гейт насытился и градиент не идёт".
+    if isinstance(model, CfCSequenceModel):
+        # CfC: полная диагностика за один проход — pre-sigmoid, W_a(z)/W_b(z) отдельно, z по
+        # seg_type/dt-режиму, градиентные нормы W_a/W_b (нужен batch, а не весь train — иначе
+        # backward по всей последовательности дорогой; используем полный train batch,
+        # т.к. это диагностика, не шаг оптимизации, и opt.step() после неё не вызывается).
+        full_gate_diagnostics(model, feats, tau, true=true, seg_type=batch["seg_type"],
+                               dt_spike_mask=batch["dt_spike_mask"], label="sigma_tau")
+    elif isinstance(model, NeuralODEEventModel):
         with torch.no_grad():
             model(feats, tau, record_gates=True)
             g = model.last_gate_log
             frac_low = (g < 0.02).float().mean().item()
             frac_high = (g > 0.98).float().mean().item()
-            label = "sigma_tau" if isinstance(model, CfCSequenceModel) else "event_prob"
-            print(f"    [gate-diag] {label} mean={g.mean().item():.3f} std={g.std().item():.3f} "
+            print(f"    [gate-diag] event_prob mean={g.mean().item():.3f} std={g.std().item():.3f} "
                   f"sat_low(<0.02)={frac_low:.1%} sat_high(>0.98)={frac_high:.1%}")
     return model
 
