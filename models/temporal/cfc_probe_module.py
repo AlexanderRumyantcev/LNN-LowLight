@@ -205,8 +205,8 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
                            verbose: bool = True) -> dict:
     """
     Один проход даёт срез сразу по ВСЕМ параметрам CfC-ячейки (2026-08-01, расширено по запросу
-    пользователя — раньше не хватало g/h_cand и градиентов backbone/W_g/W_h, вывода было
-    недостаточно для выводов, только для гипотез):
+    пользователя — раньше не хватало g/h_cand, градиентов backbone/W_g/W_h, распределения dt и
+    прямой (не через offset-since-jump) связи гейта со своим фактическим входом):
       - saturation sigma_tau (как в predict_cfc_with_gates)
       - pre_sigmoid = t_a*dt + t_b — ДО сжатия сигмоидой
       - t_a = W_a(z) и t_b = W_b(z) — отдельно друг от друга и от dt
@@ -218,6 +218,12 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
       - если передан `true` — градиентная норма ВСЕХ обучаемых слоёв ячейки (backbone[0],
         W_g, W_h, W_a, W_b) после ОДНОГО backward (не эпохи обучения) — прямая проверка,
         какой из пяти слоёв (если хоть один) не получает полезный градиент.
+      - распределение самого dt (перцентили) рядом с типичным масштабом |t_a|*dt — отвечает на
+        вопрос "гейт физически МОЖЕТ уйти далеко от 0.5 на типичном dt, или t_a слишком мал
+        относительно реального диапазона dt, и это ограничение по конструкции, а не по обучению".
+      - sigma_tau/pre_sigmoid, забинченные НАПРЯМУЮ по величине dt (не по offset-since-jump,
+        который является другой переменной и может не коррелировать с dt пробы) — прямая
+        проверка "реагирует ли гейт хотя бы на собственный прямой вход".
 
     u_seq: [B, T, input_dim], dt_seq: [B, T] или [B, T, 1], true: [B, T, obs_dim] опционально.
     seg_type: [B, T] int-коды сегментов (см. evaluation.metrics.SEGMENT_NAMES), опционально.
@@ -281,6 +287,43 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
                                      t_a_mean=float(t_a[mask].mean()), t_b_mean=float(t_b[mask].mean()))
         result["by_seg_type"] = by_seg
 
+    # --- dt-распределение vs масштаб t_a (2026-08-01) --------------------------------------
+    # dt_seq на входе может быть [B,T] или [B,T,1]; приводим к [B,T] для перцентилей.
+    dt_flat = dt_seq.detach().reshape(dt_seq.shape[0], dt_seq.shape[1]).reshape(-1).float()
+    q_levels = torch.tensor([0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99], device=dt_flat.device)
+    dt_q = torch.quantile(dt_flat, q_levels)
+    t_a_abs_mean = float(t_a.abs().mean())
+    result["dt_distribution"] = {
+        "p01": float(dt_q[0]), "p10": float(dt_q[1]), "p25": float(dt_q[2]),
+        "p50": float(dt_q[3]), "p75": float(dt_q[4]), "p90": float(dt_q[5]), "p99": float(dt_q[6]),
+        "min": float(dt_flat.min()), "max": float(dt_flat.max()),
+    }
+    result["t_a_dt_scale"] = {
+        "t_a_abs_mean": t_a_abs_mean,
+        # |t_a|*dt на типичном (p50) и экстремальном (p99) dt — во сколько сигмоида реально может
+        # сдвинуться от 0 при типичном/редком dt, ПРИ ТЕКУЩЕМ масштабе t_a (не считая t_b)
+        "|t_a|*dt_p50": t_a_abs_mean * float(dt_q[3]),
+        "|t_a|*dt_p90": t_a_abs_mean * float(dt_q[5]),
+        "|t_a|*dt_p99": t_a_abs_mean * float(dt_q[6]),
+    }
+
+    # --- sigma_tau/pre_sigmoid забинченные напрямую по dt (не по offset-since-jump) --------
+    sig_tau_bt = sig_tau.mean(dim=-1).reshape(-1)     # (B,T) -> (B*T,), усреднено по hidden
+    pre_sig_bt = pre_sig.mean(dim=-1).reshape(-1)
+    dt_bin_edges = torch.quantile(dt_flat, torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0], device=dt_flat.device))
+    dt_bin_edges[-1] = dt_bin_edges[-1] + 1e-6  # включить максимум в последний бин
+    by_dt_bin = {}
+    for i in range(5):
+        lo, hi = float(dt_bin_edges[i]), float(dt_bin_edges[i + 1])
+        mask = (dt_flat >= lo) & (dt_flat < hi)
+        if mask.any():
+            by_dt_bin[f"dt[{lo:.2f},{hi:.2f})"] = dict(
+                n=int(mask.sum()),
+                sigma_tau_mean=float(sig_tau_bt[mask].mean()),
+                pre_sigmoid_mean=float(pre_sig_bt[mask].mean()),
+            )
+    result["by_dt_bin"] = by_dt_bin
+
     if verbose:
         print(f"    [full-gate-diag] {label}")
         st = result["sigma_tau"]
@@ -305,5 +348,14 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
         if "by_seg_type" in result:
             for seg, s in result["by_seg_type"].items():
                 print(f"      seg={seg:7s}     z_norm={s['z_norm_mean']:.3f} t_a={s['t_a_mean']:.3f} t_b={s['t_b_mean']:.3f}")
+        dd = result["dt_distribution"]
+        print(f"      dt dist:        p01={dd['p01']:.3f} p10={dd['p10']:.3f} p50={dd['p50']:.3f} "
+              f"p90={dd['p90']:.3f} p99={dd['p99']:.3f} max={dd['max']:.3f}")
+        ts = result["t_a_dt_scale"]
+        print(f"      |t_a|*dt:       |t_a|_mean={ts['t_a_abs_mean']:.4f} "
+              f"at_p50={ts['|t_a|*dt_p50']:.4f} at_p90={ts['|t_a|*dt_p90']:.4f} at_p99={ts['|t_a|*dt_p99']:.4f}")
+        for bin_label, s in by_dt_bin.items():
+            print(f"      {bin_label:18s} n={s['n']:5d} sigma_tau={s['sigma_tau_mean']:.4f} "
+                  f"pre_sigmoid={s['pre_sigmoid_mean']:.4f}")
 
     return result
