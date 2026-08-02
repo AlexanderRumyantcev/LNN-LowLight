@@ -39,7 +39,7 @@ import numpy as np
 import torch
 
 from data.synthetic_probe_scene import SceneGenConfig, generate_scene, sample_probe_sequence, SEG_STEP
-from models.temporal.cfc_probe_module import CfCProbeModule, full_gate_diagnostics
+from models.temporal.cfc_probe_module import CfCProbeModule, full_gate_diagnostics, calibrate_time_gate_init
 from models.baselines import NRDStyleBaseline, NRCStyleBaseline
 from models.losses import NRCRelativeL2Loss
 from evaluation.metrics import (
@@ -101,6 +101,10 @@ def train_model(kind: str, batch, device, epochs: int, lr: float, hidden_dim: in
     if kind == "cfc":
         model = CfCProbeModule(hidden_dim=hidden_dim, use_staleness=True).to(device)
         u = model.build_input(obs, cold, conf, use_staleness=True)
+        # Data-driven калибровка масштаба time-gate (2026-08-01, см. mempalace/LNN_LowLight/risks
+        # — dt в synthetic_probe_scene.py условный, поэтому масштаб W_a калибруется по фактическим
+        # данным на входе, а не хардкодится числом; см. calibrate_time_gate_init).
+        calibrate_time_gate_init(model, u, dt, target_pre_sigmoid_std=2.0)
         forward = lambda: model(u, dt)[0]
     elif kind == "nrc_honest":
         model = NRCStyleBaseline(hidden_dim=hidden_dim, use_staleness=True).to(device)

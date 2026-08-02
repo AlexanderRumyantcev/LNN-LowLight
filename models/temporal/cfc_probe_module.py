@@ -69,7 +69,13 @@ class CfCProbeCell(nn.Module):
         h_cand = torch.tanh(self.W_h(z))
         t_a = self.W_a(z)
         t_b = self.W_b(z)
-        pre_sigmoid = t_a * dt_t + t_b
+        # log1p(dt) вместо сырого dt (2026-08-01, см. full_gate_diagnostics-диагностику масштаба
+        # t_a): душит тяжёлый хвост Δt-выбросов, сохраняя dt=0 -> log1p(dt)=0 (т.е. по-прежнему
+        # sigma_tau при dt->0 зависит только от t_b — корректное continuous-time поведение).
+        # Масштаб самого t_a калибруется ОТДЕЛЬНО и один раз, см. calibrate_time_gate_init() —
+        # НЕ хардкодится здесь под конкретный датасет.
+        dt_log = torch.log1p(dt_t)
+        pre_sigmoid = t_a * dt_log + t_b
         sigma_tau = torch.sigmoid(pre_sigmoid)
         self.last_sigma_tau = sigma_tau.detach()
         # без detach — full_gate_diagnostics делает backward через ВСЕ эти величины, чтобы
@@ -193,6 +199,54 @@ class CfCProbeModule(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Data-driven калибровка масштаба time-gate (2026-08-01) — НЕ хардкодит числа под конкретный
+# датасет (см. риск в mempalace: dt_range/dt_spike_* в synthetic_probe_scene.py — временная
+# синтетика, копия калибровки из spike-теста, не связана с реальными Blender-данными). Вместо
+# этого один раз ПЕРЕД обучением измеряет фактический масштаб t_a*log1p(dt) НА ТЕХ ДАННЫХ, что
+# переданы (синтетика сейчас, Blender позже — не важно), и домножает W_a на коэффициент так,
+# чтобы typical pre-sigmoid попадал в чувствительный диапазон сигмоиды. При смене датасета
+# (другой масштаб dt) калибровка автоматически пересчитывается заново — ничего не захардкожено.
+# ---------------------------------------------------------------------------
+def calibrate_time_gate_init(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: torch.Tensor,
+                              target_pre_sigmoid_std: float = 2.0, verbose: bool = True) -> float:
+    """
+    Измеряет std(t_a * log1p(dt)) на переданном батче (при текущей, ещё не откалиброванной
+    инициализации W_a) и домножает W_a.weight/bias на scale_factor = target_std / current_std,
+    так что std этой величины после калибровки ~= target_pre_sigmoid_std.
+
+    Почему масштабируем ИМЕННО W_a (не W_b, не backbone): W_b — это offset (значение гейта при
+    dt->0), его масштаб не связан с чувствительностью к dt и трогать не нужно. t_a должен
+    определять НАСКОЛЬКО сильно сигмоида реагирует на log1p(dt) — это единственный параметр,
+    отвечающий за эту чувствительность (см. полный разбор роли t_a в чате/mempalace 2026-08-01).
+
+    target_pre_sigmoid_std=2.0 — эвристика: sigmoid(±2) ~= {0.12, 0.88}, т.е. typical dt должен
+    быть способен сдвинуть гейт к границам разумного рабочего диапазона, не только к крайним
+    выбросам dt. Не привязано к конкретным числам синтетики — это просто "насколько чувствительна
+    сигмоида должна быть по построению", безразмерная величина.
+
+    Возвращает применённый scale_factor (для логирования/воспроизводимости).
+    """
+    with torch.no_grad():
+        model(u_seq, dt_seq, record_gates=True)
+        diag = model.last_diag_log
+        t_a = diag["t_a"]
+        dt_seq_3d = dt_seq.unsqueeze(-1) if dt_seq.dim() == 2 else dt_seq
+        dt_log = torch.log1p(dt_seq_3d)
+        current_component = t_a * dt_log  # тот же член, что входит в pre_sigmoid = t_a*log1p(dt)+t_b
+        current_std = float(current_component.std())
+        scale_factor = target_pre_sigmoid_std / max(current_std, 1e-6)
+
+        model.cell.W_a.weight.mul_(scale_factor)
+        model.cell.W_a.bias.mul_(scale_factor)
+
+    if verbose:
+        print(f"    [calibrate_time_gate_init] current_std={current_std:.4f} "
+              f"target_std={target_pre_sigmoid_std:.4f} scale_factor={scale_factor:.3f}")
+
+    return scale_factor
+
+
+# ---------------------------------------------------------------------------
 # Комплексная gate-диагностика (2026-08-01) — ВСЕ метрики за один проход, вместо проверки по
 # одной. Портирована из spike_test/models/models.py::full_gate_diagnostics на формат этого
 # production-модуля (u_seq/dt_seq вместо features/tau). Отвечает на вопрос: если σ_τ зажат в
@@ -208,7 +262,8 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
     пользователя — раньше не хватало g/h_cand, градиентов backbone/W_g/W_h, распределения dt и
     прямой (не через offset-since-jump) связи гейта со своим фактическим входом):
       - saturation sigma_tau (как в predict_cfc_with_gates)
-      - pre_sigmoid = t_a*dt + t_b — ДО сжатия сигмоидой
+      - pre_sigmoid = t_a*log1p(dt) + t_b — ДО сжатия сигмоидой (2026-08-01: log1p(dt), не сырой
+        dt, см. calibrate_time_gate_init() и CfCProbeCell.forward)
       - t_a = W_a(z) и t_b = W_b(z) — отдельно друг от друга и от dt
       - g = tanh(W_g z) и h_cand = tanh(W_h z) — ДВА кандидата состояния (не только гейт;
         если они сами насыщены в ±1, узкий диапазон h' объясняется НЕ гейтом, а кандидатами)
@@ -266,7 +321,7 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
         "sigma_tau": {**stats(sig_tau),
                       "sat_low(<0.02)": float((sig_tau < 0.02).float().mean()),
                       "sat_high(>0.98)": float((sig_tau > 0.98).float().mean())},
-        "pre_sigmoid(t_a*dt+t_b)": stats(pre_sig),
+        "pre_sigmoid(t_a*log1p(dt)+t_b)": stats(pre_sig),
         "t_a=W_a(z)": stats(t_a),
         "t_b=W_b(z)": stats(t_b),
         "g=tanh(W_g*z)": {**stats(g), "sat(|g|>0.98)": 1.0 - sat_frac(g.abs(), -1.0, 0.98)},
@@ -287,11 +342,13 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
                                      t_a_mean=float(t_a[mask].mean()), t_b_mean=float(t_b[mask].mean()))
         result["by_seg_type"] = by_seg
 
-    # --- dt-распределение vs масштаб t_a (2026-08-01) --------------------------------------
+    # --- dt-распределение vs масштаб t_a (2026-08-01, обновлено под log1p(dt)-фикс) -----------
     # dt_seq на входе может быть [B,T] или [B,T,1]; приводим к [B,T] для перцентилей.
     dt_flat = dt_seq.detach().reshape(dt_seq.shape[0], dt_seq.shape[1]).reshape(-1).float()
+    dt_log_flat = torch.log1p(dt_flat)  # реальный вход гейта после фикса (не сырой dt)
     q_levels = torch.tensor([0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99], device=dt_flat.device)
     dt_q = torch.quantile(dt_flat, q_levels)
+    dt_log_q = torch.quantile(dt_log_flat, q_levels)
     t_a_abs_mean = float(t_a.abs().mean())
     result["dt_distribution"] = {
         "p01": float(dt_q[0]), "p10": float(dt_q[1]), "p25": float(dt_q[2]),
@@ -300,11 +357,10 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
     }
     result["t_a_dt_scale"] = {
         "t_a_abs_mean": t_a_abs_mean,
-        # |t_a|*dt на типичном (p50) и экстремальном (p99) dt — во сколько сигмоида реально может
-        # сдвинуться от 0 при типичном/редком dt, ПРИ ТЕКУЩЕМ масштабе t_a (не считая t_b)
-        "|t_a|*dt_p50": t_a_abs_mean * float(dt_q[3]),
-        "|t_a|*dt_p90": t_a_abs_mean * float(dt_q[5]),
-        "|t_a|*dt_p99": t_a_abs_mean * float(dt_q[6]),
+        # |t_a|*log1p(dt) — РЕАЛЬНЫЙ член pre_sigmoid (после log1p-фикса), не |t_a|*сырой dt
+        "|t_a|*log1p(dt)_p50": t_a_abs_mean * float(dt_log_q[3]),
+        "|t_a|*log1p(dt)_p90": t_a_abs_mean * float(dt_log_q[5]),
+        "|t_a|*log1p(dt)_p99": t_a_abs_mean * float(dt_log_q[6]),
     }
 
     # --- sigma_tau/pre_sigmoid забинченные напрямую по dt (не по offset-since-jump) --------
@@ -329,7 +385,7 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
         st = result["sigma_tau"]
         print(f"      sigma_tau:      mean={st['mean']:.3f} std={st['std']:.3f} "
               f"sat_low={st['sat_low(<0.02)']:.1%} sat_high={st['sat_high(>0.98)']:.1%}")
-        ps = result["pre_sigmoid(t_a*dt+t_b)"]
+        ps = result["pre_sigmoid(t_a*log1p(dt)+t_b)"]
         print(f"      pre-sigmoid:    mean={ps['mean']:.3f} std={ps['std']:.3f} range=[{ps['min']:.3f}, {ps['max']:.3f}]")
         ta, tb = result["t_a=W_a(z)"], result["t_b=W_b(z)"]
         print(f"      t_a=W_a(z):     mean={ta['mean']:.3f} std={ta['std']:.3f} range=[{ta['min']:.3f}, {ta['max']:.3f}]")
@@ -352,8 +408,9 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
         print(f"      dt dist:        p01={dd['p01']:.3f} p10={dd['p10']:.3f} p50={dd['p50']:.3f} "
               f"p90={dd['p90']:.3f} p99={dd['p99']:.3f} max={dd['max']:.3f}")
         ts = result["t_a_dt_scale"]
-        print(f"      |t_a|*dt:       |t_a|_mean={ts['t_a_abs_mean']:.4f} "
-              f"at_p50={ts['|t_a|*dt_p50']:.4f} at_p90={ts['|t_a|*dt_p90']:.4f} at_p99={ts['|t_a|*dt_p99']:.4f}")
+        print(f"      |t_a|*log1p(dt): |t_a|_mean={ts['t_a_abs_mean']:.4f} "
+              f"at_p50={ts['|t_a|*log1p(dt)_p50']:.4f} at_p90={ts['|t_a|*log1p(dt)_p90']:.4f} "
+              f"at_p99={ts['|t_a|*log1p(dt)_p99']:.4f}")
         for bin_label, s in by_dt_bin.items():
             print(f"      {bin_label:18s} n={s['n']:5d} sigma_tau={s['sigma_tau_mean']:.4f} "
                   f"pre_sigmoid={s['pre_sigmoid_mean']:.4f}")
