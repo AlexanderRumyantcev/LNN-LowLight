@@ -1,0 +1,19 @@
+{
+  "probe_name": "Probe_000",
+  "created_at_local": [
+    1.25,
+    -2.5,
+    0.8
+  ],
+  "extracted_world_position": [
+    7.651650428771973,
+    2.116116523742676,
+    0.800000011920929
+  ],
+  "independently_expected_world_position": [
+    7.651650428771973,
+    2.116116523742676,
+    0.800000011920929
+  ],
+  "match": true
+}

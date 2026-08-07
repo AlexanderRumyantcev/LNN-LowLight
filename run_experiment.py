@@ -40,7 +40,7 @@ import torch
 
 from data.synthetic_probe_scene import SceneGenConfig, generate_scene, sample_probe_sequence
 from models.temporal.cfc_probe_module import CfCProbeModule, full_gate_diagnostics, calibrate_time_gate_init
-from models.baselines import NRDStyleBaseline, NRCStyleBaseline
+from models.baselines import NRDStyleBaseline, NRCStyleBaseline, GRUProbeBaseline
 from models.losses import NRCRelativeL2Loss
 from evaluation.metrics import (
     label_samples, early_zone_floor_split, per_segment_type_mse, error_vs_offset_curve,
@@ -52,16 +52,30 @@ BIN_LABELS = [f"[{BIN_EDGES[i]:g},{BIN_EDGES[i+1]:g})" for i in range(len(BIN_ED
 SEGMENT_TYPE_NAMES = list(SEGMENT_NAMES.values())  # ["static", "step", "drift"]
 
 
+def _stack_feature(seqs, indices, key, T):
+    """Стек [n_probes, T, obs_dim] по ключу. Источники дают либо скаляр на шаг
+    (data/synthetic_probe_scene.py — массив формы (T,), obs_dim=1 добавляется
+    явно), либо готовый вектор (blender/dataset_adapter.py — RGB, форма (T,3),
+    дыра №3 РЕШЕНА: не схлопывается в скаляр, поэтому здесь не унифицируется
+    принудительным unsqueeze — feature-размерность берётся из самих данных)."""
+    arr = np.stack([seqs[i][key][:T] for i in indices])
+    if arr.ndim == 2:  # [n_probes, T] -> [n_probes, T, 1]
+        arr = arr[..., None]
+    return torch.tensor(arr, dtype=torch.float32)
+
+
 def build_batch(seqs, indices):
-    """Собирает батч [n_probes, T, ...] по общей МИНИМАЛЬНОЙ длине среди выбранных проб
-    (последовательности асинхронны и разной длины — см. data/synthetic_probe_scene.py)."""
+    """Собирает батч [n_probes, T, obs_dim] по общей МИНИМАЛЬНОЙ длине среди выбранных
+    проб (последовательности асинхронны и разной длины — см. data/synthetic_probe_scene.py
+    и blender/dataset_adapter.py). obs_dim выводится из формы данных (1 для скалярного
+    synthetic-пути, 3 для RGB-адаптера) — не хардкодится."""
     T = min(len(seqs[i]["t"]) for i in indices)
-    obs = torch.tensor(np.stack([seqs[i]["obs"][:T] for i in indices]), dtype=torch.float32).unsqueeze(-1)
+    obs = _stack_feature(seqs, indices, "obs", T)
     dt = torch.tensor(np.stack([seqs[i]["dt"][:T] for i in indices]), dtype=torch.float32)
     cold = torch.tensor(np.stack([seqs[i]["cold_start"][:T] for i in indices]), dtype=torch.float32)
     spp = torch.tensor(np.stack([seqs[i]["spp"][:T] for i in indices]), dtype=torch.float32)
     conf = torch.log1p(spp) / np.log1p(64.0)
-    true = torch.tensor(np.stack([seqs[i]["true_irradiance"][:T] for i in indices]), dtype=torch.float32).unsqueeze(-1)
+    true = _stack_feature(seqs, indices, "true_irradiance", T)
     t_arr = np.stack([seqs[i]["t"][:T] for i in indices])
     return dict(obs=obs, dt=dt, cold=cold, conf=conf, true=true, t=t_arr)
 
@@ -72,8 +86,11 @@ def train_model(kind: str, batch, device, epochs: int, lr: float, hidden_dim: in
         batch["obs"].to(device), batch["dt"].to(device),
         batch["cold"].to(device), batch["conf"].to(device), batch["true"].to(device),
     )
+    # obs_dim выводится из формы данных (1 — старый synthetic-путь, 3 — RGB из
+    # blender/dataset_adapter.py), не хардкодится — см. _stack_feature/build_batch.
+    obs_dim = obs.shape[-1]
     if kind == "cfc":
-        model = CfCProbeModule(hidden_dim=hidden_dim, use_staleness=True).to(device)
+        model = CfCProbeModule(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True).to(device)
         u = model.build_input(obs, cold, conf, use_staleness=True)
         # Data-driven калибровка масштаба time-gate (2026-08-01, см. mempalace/LNN_LowLight/risks
         # — dt в synthetic_probe_scene.py условный, поэтому масштаб W_a калибруется по фактическим
@@ -81,13 +98,21 @@ def train_model(kind: str, batch, device, epochs: int, lr: float, hidden_dim: in
         calibrate_time_gate_init(model, u, dt, target_pre_sigmoid_std=2.0)
         forward = lambda: model(u, dt)[0]
     elif kind == "nrc_honest":
-        model = NRCStyleBaseline(hidden_dim=hidden_dim, use_staleness=True).to(device)
+        model = NRCStyleBaseline(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True).to(device)
         u = NRCStyleBaseline.build_input(obs, cold, conf, use_staleness=True)
         forward = lambda: model(u)
     elif kind == "nrc_faithful":
-        model = NRCStyleBaseline(hidden_dim=hidden_dim, use_staleness=False).to(device)
+        model = NRCStyleBaseline(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=False).to(device)
         u = NRCStyleBaseline.build_input(obs, use_staleness=False)
         forward = lambda: model(u)
+    elif kind == "gru_honest":
+        model = GRUProbeBaseline(obs_dim=obs_dim, hidden_dim=hidden_dim, use_dt_staleness=True).to(device)
+        u = GRUProbeBaseline.build_input(obs, dt, cold, conf, use_dt_staleness=True)
+        forward = lambda: model(u)[0]
+    elif kind == "gru_faithful":
+        model = GRUProbeBaseline(obs_dim=obs_dim, hidden_dim=hidden_dim, use_dt_staleness=False).to(device)
+        u = GRUProbeBaseline.build_input(obs, use_dt_staleness=False)
+        forward = lambda: model(u)[0]
     else:
         raise ValueError(kind)
 
@@ -115,6 +140,12 @@ def predict(kind: str, model_or_none, batch, device, tau_nrd: float = 3.0, alpha
         if kind == "nrc_faithful":
             u = NRCStyleBaseline.build_input(obs, use_staleness=False)
             return model_or_none(u).cpu().numpy()
+        if kind == "gru_honest":
+            u = GRUProbeBaseline.build_input(obs, dt, cold, conf, use_dt_staleness=True)
+            return model_or_none(u)[0].cpu().numpy()
+        if kind == "gru_faithful":
+            u = GRUProbeBaseline.build_input(obs, use_dt_staleness=False)
+            return model_or_none(u)[0].cpu().numpy()
         if kind == "nrd_faithful":
             m = NRDStyleBaseline(alpha=alpha_nrd, use_honest_dt=False).to(device)
             return m(obs, dt).cpu().numpy()
@@ -135,7 +166,8 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
         device = torch.device("cpu")
     print(f"device: {device}")
 
-    model_kinds = ["cfc", "nrd_faithful", "nrd_honest", "nrc_faithful", "nrc_honest"]
+    model_kinds = ["cfc", "nrd_faithful", "nrd_honest", "nrc_faithful", "nrc_honest",
+                   "gru_faithful", "gru_honest"]
     early_by_kind = {k: [] for k in model_kinds}
     floor_by_kind = {k: [] for k in model_kinds}
     # §6.3 — MSE по типу сегмента (static/step/drift), отдельный список ПО СИДАМ на каждый kind/тип
@@ -158,6 +190,8 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
         cfc_model = train_model("cfc", train_batch, device, epochs, lr, hidden_dim)
         nrc_f_model = train_model("nrc_faithful", train_batch, device, epochs, lr, hidden_dim)
         nrc_h_model = train_model("nrc_honest", train_batch, device, epochs, lr, hidden_dim)
+        gru_f_model = train_model("gru_faithful", train_batch, device, epochs, lr, hidden_dim)
+        gru_h_model = train_model("gru_honest", train_batch, device, epochs, lr, hidden_dim)
 
         # ПОЛНАЯ gate-диагностика (2026-08-01, за ОДИН проход вместо проверки по одной метрике):
         # pre-sigmoid, W_a(z)/W_b(z) отдельно, z по seg_type, градиентные нормы W_a/W_b —
@@ -185,6 +219,8 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
             "nrd_honest": predict("nrd_honest", None, eval_batch, device),
             "nrc_faithful": predict("nrc_faithful", nrc_f_model, eval_batch, device),
             "nrc_honest": predict("nrc_honest", nrc_h_model, eval_batch, device),
+            "gru_faithful": predict("gru_faithful", gru_f_model, eval_batch, device),
+            "gru_honest": predict("gru_honest", gru_h_model, eval_batch, device),
         }
         true = eval_batch["true"].numpy()
         t_arr = eval_batch["t"]
@@ -253,7 +289,7 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
         print(row)
 
     print("\n=== §5.2 критерий: CfC-B vs честные baseline'ы (paired bootstrap, early-zone, агрегат) ===")
-    for honest_kind in ["nrd_honest", "nrc_honest"]:
+    for honest_kind in ["nrd_honest", "nrc_honest", "gru_honest"]:
         res = paired_bootstrap_significance(
             np.array(early_by_kind["cfc"]), np.array(early_by_kind[honest_kind]),
         )
@@ -264,7 +300,7 @@ def run(n_seeds: int, n_probes: int, n_train_probes: int, epochs: int, lr: float
     print("(тот же paired bootstrap §6.4, но НЕ агрегат — чтобы увидеть, меняется ли вывод")
     print(" в зависимости от типа динамики; NaN у части сидов для сегмента -> пропуск с пометкой)")
     for seg_name in SEGMENT_TYPE_NAMES:
-        for honest_kind in ["nrd_honest", "nrc_honest"]:
+        for honest_kind in ["nrd_honest", "nrc_honest", "gru_honest"]:
             a = np.array(segtype_by_kind["cfc"][seg_name])
             b = np.array(segtype_by_kind[honest_kind][seg_name])
             if np.isnan(a).any() or np.isnan(b).any():

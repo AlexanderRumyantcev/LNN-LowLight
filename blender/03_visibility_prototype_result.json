@@ -1,0 +1,60 @@
+{
+  "probe_pos": [
+    0.0,
+    0.0,
+    2.0
+  ],
+  "occluder_center": [
+    2.0,
+    0.0,
+    1.0
+  ],
+  "occluder_half_extent": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "results": {
+    "close_before_box": {
+      "point": [
+        0.5,
+        0.0,
+        0.0
+      ],
+      "independent_expected_visible": true,
+      "bpy_ray_cast_visible": true,
+      "match": true
+    },
+    "clearly_visible_side": {
+      "point": [
+        1.0,
+        3.0,
+        0.0
+      ],
+      "independent_expected_visible": true,
+      "bpy_ray_cast_visible": true,
+      "match": true
+    },
+    "through_box_center": {
+      "point": [
+        4.0,
+        0.0,
+        0.0
+      ],
+      "independent_expected_visible": false,
+      "bpy_ray_cast_visible": false,
+      "match": true
+    },
+    "far_beyond_but_offset_y": {
+      "point": [
+        4.0,
+        3.0,
+        0.0
+      ],
+      "independent_expected_visible": true,
+      "bpy_ray_cast_visible": true,
+      "match": true
+    }
+  },
+  "PASS": true
+}
