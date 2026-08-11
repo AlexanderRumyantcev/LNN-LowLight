@@ -20,23 +20,36 @@ BLENDER_DIR = PROJECT_ROOT / "blender"
 BLENDER_BIN = "/Applications/Blender.app/Contents/MacOS/Blender"
 
 
-def run_blender_script(script_name: str, timeout: int = 120) -> dict:
+def run_blender_script(script_name: str, timeout: int = 120, args=None,
+                        result_filename: str = None) -> dict:
     """Запустить blender/<script_name> headless и вернуть его *_result.json.
 
     Падает с понятной ошибкой, если бинарник Blender недоступен, если
     процесс завершился с ненулевым кодом (сам скрипт уже делает
     sys.exit(1) при провале своей внутренней проверки), или если
     результирующий JSON не нашёлся/не распарсился.
+
+    args — необязательный список позиционных CLI-аргументов, переданных
+    скрипту после '--' (см. generate_dataset.py/generate_dataset_dense.py
+    duration override).
+    result_filename — необязательное переопределение имени файла
+    результата (по умолчанию <script_stem>_result.json); нужно для
+    скриптов вроде generate_dataset_dense.py, чей *_result_meta.json —
+    не тот же файл, что определяется по умолчанию из имени скрипта.
     """
     script_path = BLENDER_DIR / script_name
     assert script_path.exists(), f"prototype script not found: {script_path}"
 
-    result_path = BLENDER_DIR / (script_path.stem + "_result.json")
+    result_path = BLENDER_DIR / (result_filename or (script_path.stem + "_result.json"))
     if result_path.exists():
         result_path.unlink()  # чтобы не подхватить старый результат при падении рендера
 
+    cmd = [BLENDER_BIN, "--background", "--python", str(script_path)]
+    if args:
+        cmd += ["--"] + [str(a) for a in args]
+
     proc = subprocess.run(
-        [BLENDER_BIN, "--background", "--python", str(script_path)],
+        cmd,
         cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,

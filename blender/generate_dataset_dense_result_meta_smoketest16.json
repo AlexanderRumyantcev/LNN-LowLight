@@ -1,0 +1,68 @@
+{
+  "n_frames": 4,
+  "dt": 8.0,
+  "grid_res": 16,
+  "total_duration": 24.0,
+  "samples_max": 128,
+  "reference_spp": 2048,
+  "camera_config": {
+    "n_revolutions": 2.0,
+    "radius": 8.0,
+    "height": 3.0,
+    "center": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "buffer_shapes": {
+    "position": [
+      4,
+      16,
+      16,
+      3
+    ],
+    "normal": [
+      4,
+      16,
+      16,
+      3
+    ],
+    "albedo": [
+      4,
+      16,
+      16,
+      3
+    ],
+    "irradiance": [
+      4,
+      16,
+      16,
+      3
+    ],
+    "true_irradiance": [
+      4,
+      16,
+      16,
+      3
+    ],
+    "spp": [
+      4,
+      16,
+      16
+    ],
+    "valid": [
+      4,
+      16,
+      16
+    ],
+    "motion_vector": [
+      4,
+      16,
+      16,
+      2
+    ]
+  },
+  "total_edge_mismatch_px": 1,
+  "npz_path": "/Users/alexandrrumyantsev/Desktop/LNN_LowLight_Project/blender/generate_dataset_dense_result_smoketest16.npz"
+}

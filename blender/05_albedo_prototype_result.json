@@ -1,0 +1,37 @@
+{
+  "light_100": {
+    "tag": "light_100",
+    "light_energy": 100.0,
+    "albedo_pixel": [
+      0.4931049346923828,
+      0.4931049346923828,
+      0.4931049346923828
+    ],
+    "combined_pixel": [
+      0.5717284791171551,
+      0.5717284791171551,
+      0.5717284791171551
+    ]
+  },
+  "light_400": {
+    "tag": "light_400",
+    "light_energy": 400.0,
+    "albedo_pixel": [
+      0.4931049346923828,
+      0.4931049346923828,
+      0.4931049346923828
+    ],
+    "combined_pixel": [
+      2.209474191069603,
+      2.209474191069603,
+      2.209474191069603
+    ]
+  },
+  "albedo_relative_diff_between_lights": 0.0,
+  "albedo_abs_diff_from_set_base_color": 0.0068950653076171875,
+  "combined_relative_diff_between_lights": 0.7412377653343929,
+  "albedo_invariant_to_light": true,
+  "albedo_matches_base_color": true,
+  "combined_changed_as_expected": true,
+  "PASS": true
+}

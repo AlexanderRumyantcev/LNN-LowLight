@@ -1,0 +1,68 @@
+{
+  "n_frames": 51,
+  "dt": 8.0,
+  "grid_res": 8,
+  "total_duration": 400.0,
+  "samples_max": 128,
+  "reference_spp": 2048,
+  "camera_config": {
+    "n_revolutions": 2.0,
+    "radius": 8.0,
+    "height": 3.0,
+    "center": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "buffer_shapes": {
+    "position": [
+      51,
+      8,
+      8,
+      3
+    ],
+    "normal": [
+      51,
+      8,
+      8,
+      3
+    ],
+    "albedo": [
+      51,
+      8,
+      8,
+      3
+    ],
+    "irradiance": [
+      51,
+      8,
+      8,
+      3
+    ],
+    "true_irradiance": [
+      51,
+      8,
+      8,
+      3
+    ],
+    "spp": [
+      51,
+      8,
+      8
+    ],
+    "valid": [
+      51,
+      8,
+      8
+    ],
+    "motion_vector": [
+      51,
+      8,
+      8,
+      2
+    ]
+  },
+  "total_edge_mismatch_px": 5,
+  "npz_path": "/Users/alexandrrumyantsev/Desktop/LNN_LowLight_Project/blender/generate_dataset_dense_result_full.npz"
+}

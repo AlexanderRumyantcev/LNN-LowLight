@@ -173,3 +173,105 @@ def paired_bootstrap_significance(
         mean_diff=mean_diff, ci_low=float(lo), ci_high=float(hi),
         n_seeds=n_seeds, significant=significant,
     )
+
+
+# ---------------------------------------------------------------------------
+# §6 delta (TZ_stage1b_per_pixel_dense_fallback.md) — новый срез по disocclusion,
+# ОРТОГОНАЛЬНЫЙ static/step/drift разбивке выше (та завязана на световой
+# сигнал light_schedule, эта — на геометрический сигнал disocclusion_flag §2.5).
+#
+# per_segment_type_mse/error_vs_offset_curve/early_zone_floor_split НЕ трогаются
+# (§6 ТЗ: "без изменений") — именно они остаются источником static/step/drift
+# срезов и для dense-пути (та же логика применяется к light_schedule dense-
+# генератора, см. blender/generate_dataset_dense.py/light_schedule.py).
+# ---------------------------------------------------------------------------
+
+
+def disocclusion_vs_stable_mse(
+    pred: np.ndarray, true: np.ndarray, disocclusion_flag: np.ndarray
+) -> dict:
+    """§6 delta — MSE раздельно для disocclusion vs non-disocclusion пикселей
+    (флаг §2.5), ОРТОГОНАЛЬНО к static/step/drift (per_segment_type_mse) —
+    именно этот срез определяет исход §5 stage1b (три возможных исхода),
+    не агрегат по всему кадру.
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    flag = np.asarray(disocclusion_flag).astype(bool)
+    if pred.shape != flag.shape:
+        raise ValueError(
+            f"pred/disocclusion_flag shape mismatch: {pred.shape} vs {flag.shape}"
+        )
+    sq_err = (pred - true) ** 2
+    stable = ~flag
+    return dict(
+        disocclusion=float(sq_err[flag].mean()) if flag.any() else float("nan"),
+        stable=float(sq_err[stable].mean()) if stable.any() else float("nan"),
+    )
+
+
+def compute_age_since_disocclusion(disocclusion_flag: np.ndarray) -> np.ndarray:
+    """Возраст (в шагах последовательности, НЕ реальном времени — регулярный
+    Δt дозволяет это, §2.3) с последнего disocclusion-события: 0 в самом
+    событии (disocclusion_flag=1), растёт на 1 с каждым следующим стабильным
+    шагом. NaN — до первого события в этой последовательности (если весь
+    префикс стабилен без единого события, что не должно случаться на
+    практике: idx=0 всегда disocclusion_flag=1 по конвенции cold-start, см.
+    blender/dataset_adapter_dense.py).
+
+    Принимает 1D [T] (одна последовательность) ИЛИ 2D [B, T] (батч
+    независимых последовательностей — возраст считается ОТДЕЛЬНО по каждой
+    строке, события одного пикселя не влияют на другой).
+    """
+    flag = np.asarray(disocclusion_flag).astype(bool)
+    if flag.ndim == 1:
+        age = np.full(flag.shape, np.nan, dtype=np.float64)
+        last_event = -1
+        for i, f in enumerate(flag):
+            if f:
+                last_event = i
+                age[i] = 0.0
+            elif last_event >= 0:
+                age[i] = float(i - last_event)
+        return age
+    if flag.ndim == 2:
+        return np.stack([compute_age_since_disocclusion(row) for row in flag], axis=0)
+    raise ValueError(f"disocclusion_flag должен быть 1D или 2D, получено ndim={flag.ndim}")
+
+
+def error_vs_warp_age_curve(
+    pred: np.ndarray,
+    true: np.ndarray,
+    disocclusion_flag: np.ndarray,
+    bin_edges: np.ndarray | None = None,
+) -> dict:
+    """§6 delta — аналог error_vs_offset_curve (§6.1), но событие-триггер —
+    disocclusion (§2.5), а не световой скачок light_schedule: "error как
+    функция возраста истории после warp (сколько кадров прошло с последней
+    валидной диссокклюзии в этом пикселе)".
+
+    pred/true/disocclusion_flag — одной формы, 1D [T] или 2D [B, T] (батч
+    пикселей, см. compute_age_since_disocclusion). Точки БЕЗ определённого
+    возраста (NaN — до первого события) исключаются из кривой, тем же
+    принципом, что error_vs_offset_curve исключает offset<0/NaN.
+    """
+    if bin_edges is None:
+        bin_edges = np.array([0, 1, 2, 3, 4, 6, 8, 12, 20, np.inf])
+
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    true = np.asarray(true, dtype=np.float64).reshape(-1)
+    age = compute_age_since_disocclusion(disocclusion_flag).reshape(-1)
+    if pred.shape != age.shape:
+        raise ValueError(f"pred/disocclusion_flag shape mismatch after flatten: {pred.shape} vs {age.shape}")
+
+    mask = ~np.isnan(age)
+    sq_err = (pred[mask] - true[mask]) ** 2
+    a = age[mask]
+
+    bin_idx = np.digitize(a, bin_edges[1:-1])
+    curve = {}
+    for b in range(len(bin_edges) - 1):
+        b_mask = bin_idx == b
+        label = f"[{bin_edges[b]:g},{bin_edges[b+1]:g})"
+        curve[label] = float(sq_err[b_mask].mean()) if b_mask.any() else float("nan")
+    return curve

@@ -1,0 +1,53 @@
+{
+  "pos1": [
+    8.0,
+    0.0,
+    3.0
+  ],
+  "pos2": [
+    7.748665289029049,
+    1.9895190973188384,
+    3.0
+  ],
+  "target1": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "target2": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "screen_pos_frame1_px": [
+    50.67542266845703,
+    25.44261932373047
+  ],
+  "screen_pos_frame2_px": [
+    46.04460906982422,
+    23.661468505859375
+  ],
+  "expected_pixel_displacement_frame1_to_2": [
+    -4.6308135986328125,
+    -1.7811508178710938
+  ],
+  "world_point_visible_frame1": true,
+  "world_point_visible_frame2": true,
+  "sample_pixel": [
+    51,
+    25
+  ],
+  "raw_vector_rgba_at_sample_pixel": [
+    0.0,
+    0.0,
+    4.553720951080322,
+    1.876711368560791
+  ],
+  "backward_vec_zw": [
+    4.553720951080322,
+    1.876711368560791
+  ],
+  "rel_error_vs_expected_backward_disp": 0.02474645881815333,
+  "resolution": 64,
+  "PASS": true
+}

@@ -1,0 +1,16 @@
+{
+  "resolution": [
+    96,
+    96
+  ],
+  "adaptive_min_samples": 4,
+  "samples_max": 128,
+  "spp_min_observed": 16.0,
+  "spp_max_observed": 128.0,
+  "low_gradient_zone_mean_spp": 49.85061113626075,
+  "high_gradient_zone_mean_spp": 127.31221719457014,
+  "within_bounds": true,
+  "spp_varies_across_image": true,
+  "high_gradient_zone_gets_more_samples": true,
+  "PASS": true
+}

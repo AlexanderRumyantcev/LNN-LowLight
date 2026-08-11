@@ -1,0 +1,90 @@
+{
+  "dt": 8.0,
+  "disocc_world_point": [
+    -3.0,
+    0.30000000000000293,
+    1.5
+  ],
+  "stable_world_point": [
+    -3.0,
+    1.400000000000004,
+    1.5
+  ],
+  "disocc_result": {
+    "warped_xy": [
+      34.76071396959863,
+      52.40301100830038
+    ],
+    "in_bounds": true,
+    "sampled_prev_position": [
+      1.7462297673187022,
+      0.6766063746755195,
+      2.210908399304799
+    ],
+    "sampled_prev_normal": [
+      0.7793334893550508,
+      0.0,
+      0.2206665106449492
+    ],
+    "geometric_mismatch_score": 1.0,
+    "disocclusion_flag": true,
+    "label": "disocc",
+    "screen_xy": [
+      40.63747024536133,
+      51.9852409362793
+    ],
+    "sampled_curr_position": [
+      -3.0,
+      0.3582297178482218,
+      1.5609725495997817
+    ],
+    "sampled_curr_normal": [
+      0.977341890335083,
+      0.022658109664916992,
+      -5.82541161975314e-08
+    ],
+    "motion_vector_zw": [
+      -5.876756275762696,
+      0.4177700720210873
+    ]
+  },
+  "stable_result": {
+    "warped_xy": [
+      43.736802011618934,
+      52.4312837645008
+    ],
+    "in_bounds": true,
+    "sampled_prev_position": [
+      -3.0,
+      0.7256693261294369,
+      1.6249485245712134
+    ],
+    "sampled_prev_normal": [
+      1.0,
+      0.0,
+      -5.960464477539063e-08
+    ],
+    "geometric_mismatch_score": 0.3364588039626324,
+    "disocclusion_flag": false,
+    "label": "stable",
+    "screen_xy": [
+      49.94574737548828,
+      51.6568717956543
+    ],
+    "sampled_curr_position": [
+      -3.0,
+      1.453380462432449,
+      1.5594258586906162
+    ],
+    "sampled_curr_normal": [
+      1.0,
+      0.0,
+      -5.960464477539063e-08
+    ],
+    "motion_vector_zw": [
+      -6.208945363869345,
+      0.7744119688465034
+    ]
+  },
+  "PASS": true
+}

@@ -43,7 +43,10 @@ def build_scene(light_energy):
     receiver.name = "Receiver"
 
     mat = bpy.data.materials.new(name="ReceiverMat")
-    bsdf = mat.node_tree.nodes["Principled BSDF"]
+    # По ТИПУ узла, не по имени: имя узла "Principled BSDF" локализуется
+    # под русским UI Blender 5.x ("Принципиальный BSDF") — обращение по
+    # имени падает с KeyError на этой машине (см. generate_dataset.py).
+    bsdf = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
     bsdf.inputs["Base Color"].default_value = (ALBEDO, ALBEDO, ALBEDO, 1.0)
     bsdf.inputs["Roughness"].default_value = 1.0
     bsdf.inputs["Metallic"].default_value = 0.0

@@ -99,9 +99,19 @@ class CfCProbeModule(nn.Module):
                       яркости на канал; при RGB можно вызывать по одному на канал
                       или расширить obs_dim=3, зависит от финального решения по каналам)
         hidden_dim:   размер скрытого состояния CfC
-        use_staleness: включать ли staleness-вектор [cold_start, confidence] во вход
-                      (§2.2 — основная конфигурация CfC-B; False даёт "голый" CfC,
-                      нужен как ablation-точка сравнения, см. spike-test mode='A')
+        use_staleness: включать ли staleness-вектор во вход (§2.2 — основная
+                      конфигурация CfC-B; False даёт "голый" CfC, нужен как
+                      ablation-точка сравнения, см. spike-test mode='A')
+        staleness_dim: размер staleness-вектора при use_staleness=True. По
+                      умолчанию 2 — [cold_start, confidence] (§2.2 основного ТЗ,
+                      probe-путь, поведение без изменений). Per-pixel dense путь
+                      (§2.6 TZ_stage1b_per_pixel_dense_fallback.md) передаёт
+                      staleness_dim=4 — [cold_start, confidence, disocclusion_flag,
+                      geometric_mismatch_score] — см. build_input(extra_staleness=...)
+                      ниже. Архитектура ячейки не меняется вообще (§2.6: "CfC-B в
+                      исходной конфигурации переносится без переделки, меняется
+                      только состав входного staleness-вектора") — расширяется
+                      только input_dim backbone'а.
     """
 
     def __init__(
@@ -109,13 +119,15 @@ class CfCProbeModule(nn.Module):
         obs_dim: int = 1,
         hidden_dim: int = 32,
         use_staleness: bool = True,
+        staleness_dim: int = 2,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim
         self.use_staleness = use_staleness
+        self.staleness_dim = staleness_dim
 
-        input_dim = obs_dim + (2 if use_staleness else 0)  # +[cold_start, confidence]
+        input_dim = obs_dim + (staleness_dim if use_staleness else 0)
         self.cell = CfCProbeCell(input_dim=input_dim, hidden_dim=hidden_dim)
         self.readout = nn.Linear(hidden_dim, obs_dim)
 
@@ -125,6 +137,7 @@ class CfCProbeModule(nn.Module):
         cold_start: torch.Tensor | None = None,
         confidence: torch.Tensor | None = None,
         use_staleness: bool = True,
+        extra_staleness: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Собирает u_t из сырых буферов пробы (§3.1) в формат входа модели.
@@ -136,6 +149,17 @@ class CfCProbeModule(nn.Module):
                                         models.py::build_features — фиксированная,
                                         не по-батчевая нормализация, важно для
                                         воспроизводимости между запусками)
+        extra_staleness: список дополнительных [B, T] каналов, добавляемых ПОСЛЕ
+                                        cold_start/confidence — probe-путь его не
+                                        передаёт (None, поведение идентично прежнему
+                                        2-элементному вектору). Per-pixel dense путь
+                                        (§2.6) передаёт [disocclusion_flag,
+                                        geometric_mismatch_score] (§2.5), полученные
+                                        из blender/disocclusion.reproject_and_check
+                                        на паре соседних кадров — НЕ вычисляется этим
+                                        модулем, подаётся уже готовым. Порядок каналов
+                                        должен совпадать с staleness_dim, который
+                                        модель получила в __init__.
         """
         if not use_staleness:
             return obs
@@ -144,7 +168,10 @@ class CfCProbeModule(nn.Module):
                 "use_staleness=True требует cold_start и confidence "
                 "(получить из spp-метаданных пробы, см. ТЗ §3.1/§3.2)"
             )
-        staleness = torch.stack([cold_start, confidence], dim=-1)  # [B, T, 2]
+        components = [cold_start, confidence]
+        if extra_staleness:
+            components.extend(extra_staleness)
+        staleness = torch.stack(components, dim=-1)  # [B, T, staleness_dim]
         return torch.cat([obs, staleness], dim=-1)
 
     def forward(
