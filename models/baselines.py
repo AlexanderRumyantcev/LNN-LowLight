@@ -19,7 +19,7 @@ import torch.nn as nn
 class NRDStyleBaseline(nn.Module):
     """
     Hand-crafted exponential accumulation (аналог NVIDIA NRD/ReBLUR/RELAX) — БЕЗ нейросети
-    во temporal-части, поэтому нет обучаемых параметров: alpha/tau — фиксированные
+    во temporal-части, поэтому нет обучаемых параметров: alpha/tau — ФИКСИРОВАННЫЕ
     гиперпараметры (как и в реальном NRD, где decay задаётся вручную/эвристикой, не обучением).
 
     faithful (use_honest_dt=False): out_t = out_{t-1}*(1-alpha) + obs_t*alpha, alpha ФИКСИРОВАН,
@@ -47,7 +47,7 @@ class NRDStyleBaseline(nn.Module):
         continuous-score МЯГКО подмешивается в тот же alpha, не через жёсткий
         reset (в отличие от faithful) — тот же исходный сигнал geometric_mismatch,
         что видит CfC-B, но использованный простой формулой без gate-архитектуры
-        (тот же принцип разделения (а)/(б) вопросов, что уже применён к
+        (тот же принцип разделения вопросов (а)/(б), что уже применён к
         use_honest_dt).
     """
 
@@ -117,9 +117,10 @@ class NRDStyleBaseline(nn.Module):
 class NRCStyleBaseline(nn.Module):
     """
     Online per-scene per-frame MLP (аналог NVIDIA NRC / AMD FSR Radiance Cache) — БЕЗ
-    рекуррентности: каждый шаг обрабатывается независимо тем же MLP (как в оригинальном
-    NRC, где каждый query — независимый forward-pass, а обучение online происходит по
-    накопленной статистике сцены, а не через carried-over hidden state между кадрами).
+    рекуррентности: каждый шаг обрабатывается независимо тем же MLP (как в
+    оригинальном NRC, где каждый query — независимый forward-pass, а обучение online
+    происходит по накопленной статистике сцены, а не через carried-over hidden state между
+    кадрами).
 
     faithful (use_staleness=False): вход = только obs, как в оригинальном NRC.
     честная версия (use_staleness=True): вход = obs + [cold_start, confidence], как у CfC-B
@@ -132,19 +133,39 @@ class NRCStyleBaseline(nn.Module):
     """
 
     def __init__(self, obs_dim: int = 1, hidden_dim: int = 32, use_staleness: bool = False,
-                 staleness_dim: int = 2):
+                 staleness_dim: int = 2, spatial_dim: int = 0, n_hidden_layers: int = 2,
+                 bias: bool = True):
         super().__init__()
         self.obs_dim = obs_dim
         self.use_staleness = use_staleness
         self.staleness_dim = staleness_dim
-        input_dim = obs_dim + (staleness_dim if use_staleness else 0)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, obs_dim),
-        )
+        # bias (09.09.2026, TZ_stage6_nrc_patent_capacity_check.md §3.2): True по умолчанию =
+        # старое поведение (обратная совместимость со всеми существующими 14 конфигурациями
+        # MODEL_KINDS). False — patent-faithful режим (US11610360, MLP без bias во всех слоях),
+        # используется ТОЛЬКО новым kind'ом nrc_honest_boosted (run_nrc_boosted_zeroday.py).
+        self.bias = bias
+        # spatial_dim (2026-08-20, models/spatial_features.py): позиционное кондиционирование
+        # (позиция+направление+normal+albedo, positional encoding) — закрывает найденный разрыв
+        # с настоящим NRC (Müller et al. 2021), см. чат/mempalace 2026-08-19/20. 0 по умолчанию
+        # = старое поведение без изменений (обратная совместимость).
+        self.spatial_dim = spatial_dim
+        # n_hidden_layers (2026-08-20, чат — литературная проверка после эксперимента с
+        # деградацией nrc_honest_spatial): 2 по умолчанию = старое поведение (обратная
+        # совместимость). Референс из литературы (Neural Radiance Cache Implementation on
+        # Mobile GPU, SIGGRAPH Asia 2025, сравнение с оригинальным Müller et al. 2021;
+        # tiny-cuda-nn DOCUMENTATION.md конфиг, воспроизводящий encoding NRC) — настоящий NRC
+        # использует 5 скрытых слоёв по 64 нейрона, у нас было 2×32. Neural Visibility Cache
+        # for Real-Time Light Sampling (arXiv 2506.05930) прямо пишет: NRC требует БОЛЬШЕЙ MLP
+        # и БОЛЬШЕГО числа шагов обучения для приемлемых результатов, чем более простые
+        # альтернативы — литературное подтверждение гипотезы недообучения после расширения
+        # входа spatial-кондиционированием (48 доп. измерений).
+        self.n_hidden_layers = n_hidden_layers
+        input_dim = obs_dim + (staleness_dim if use_staleness else 0) + spatial_dim
+        layers = [nn.Linear(input_dim, hidden_dim, bias=bias), nn.ReLU()]
+        for _ in range(n_hidden_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim, bias=bias), nn.ReLU()]
+        layers.append(nn.Linear(hidden_dim, obs_dim, bias=bias))
+        self.mlp = nn.Sequential(*layers)
 
     @staticmethod
     def build_input(
@@ -153,20 +174,29 @@ class NRCStyleBaseline(nn.Module):
         confidence: torch.Tensor | None = None,
         use_staleness: bool = False,
         extra_staleness: list[torch.Tensor] | None = None,
+        spatial: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Тот же формат входа, что CfCProbeModule.build_input (§3.1/§3.2) — для честного
         сравнения оба baseline'а и CfC-B видят идентично собранный staleness-вектор.
         extra_staleness — доп. каналы (§4.2 dense-путь: [disocclusion_flag,
-        geometric_mismatch_score]), None по умолчанию = старое 2-элементное поведение."""
-        if not use_staleness:
-            return obs
-        if cold_start is None or confidence is None:
-            raise ValueError("use_staleness=True требует cold_start и confidence")
-        components = [cold_start, confidence]
-        if extra_staleness:
-            components.extend(extra_staleness)
-        staleness = torch.stack(components, dim=-1)
-        return torch.cat([obs, staleness], dim=-1)
+        geometric_mismatch_score]), None по умолчанию = старое 2-элементное поведение.
+        spatial — [B, T, spatial_dim] позиционное кондиционирование (models/spatial_
+        features.py::build_spatial_conditioning), None по умолчанию = старое поведение без
+        пространственного входа. Порядок каналов: obs, затем staleness (если есть), затем
+        spatial (если есть) — должен совпадать с spatial_dim, переданным модели в __init__."""
+        parts = [obs]
+        if use_staleness:
+            if cold_start is None or confidence is None:
+                raise ValueError("use_staleness=True требует cold_start и confidence")
+            components = [cold_start, confidence]
+            if extra_staleness:
+                components.extend(extra_staleness)
+            parts.append(torch.stack(components, dim=-1))
+        if spatial is not None:
+            parts.append(spatial)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=-1)
 
     def forward(self, u_seq: torch.Tensor) -> torch.Tensor:
         """
@@ -205,19 +235,22 @@ class GRUProbeBaseline(nn.Module):
         disocclusion_flag, geometric_mismatch_score] (extra_staleness_dim=2) — тот же
         принцип симметрии, что у CfC-B/NRC-style. §4.3 отдельно фиксирует: на
         регулярной сетке Δt (в отличие от probe-пути) GRU-Δt перестаёт быть архитектурно
-        ущемлённым и может оказаться заметно более конкурентным baseline'ом — не баг
-        интерпретации, если сближение с CfC-B появится на dense-данных.
+        ущемлённым и может оказаться заметно более конкурентным baseline'ом — не баг интерпретации,
+        если сближение с CfC-B появится на dense-данных.
     """
 
     def __init__(self, obs_dim: int = 1, hidden_dim: int = 32, use_dt_staleness: bool = False,
-                 extra_staleness_dim: int = 0):
+                 extra_staleness_dim: int = 0, spatial_dim: int = 0):
         super().__init__()
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim
         self.use_dt_staleness = use_dt_staleness
         self.extra_staleness_dim = extra_staleness_dim
-        # +[log1p(dt), cold_start, confidence] (+ доп. каналы dense-пути, если есть)
-        input_dim = obs_dim + ((3 + extra_staleness_dim) if use_dt_staleness else 0)
+        # spatial_dim (2026-08-20, models/spatial_features.py) — см. NRCStyleBaseline.__init__
+        # докстринг-комментарий, тот же принцип симметрии.
+        self.spatial_dim = spatial_dim
+        # +[log1p(dt), cold_start, confidence] (+ доп. каналы dense-пути, если есть) + spatial
+        input_dim = obs_dim + ((3 + extra_staleness_dim) if use_dt_staleness else 0) + spatial_dim
         self.cell = nn.GRUCell(input_dim, hidden_dim)
         self.readout = nn.Linear(hidden_dim, obs_dim)
 
@@ -229,6 +262,7 @@ class GRUProbeBaseline(nn.Module):
         confidence: torch.Tensor | None = None,
         use_dt_staleness: bool = False,
         extra_staleness: list[torch.Tensor] | None = None,
+        spatial: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         obs: [B, T, obs_dim]; dt/cold_start/confidence: [B, T] (нужны только при
@@ -236,17 +270,23 @@ class GRUProbeBaseline(nn.Module):
         конкатенируется с obs как обычная фича, а не подаётся в архитектурный gate).
         extra_staleness — доп. каналы после cold_start/confidence (§4.2 dense-путь:
         [disocclusion_flag, geometric_mismatch_score]), None = старое поведение.
+        spatial — [B, T, spatial_dim] позиционное кондиционирование (models/spatial_
+        features.py), None по умолчанию = старое поведение без пространственного входа.
         """
-        if not use_dt_staleness:
-            return obs
-        if dt is None or cold_start is None or confidence is None:
-            raise ValueError("use_dt_staleness=True требует dt, cold_start и confidence")
-        dt_log = torch.log1p(dt)
-        components = [dt_log, cold_start, confidence]
-        if extra_staleness:
-            components.extend(extra_staleness)
-        extra = torch.stack(components, dim=-1)
-        return torch.cat([obs, extra], dim=-1)
+        parts = [obs]
+        if use_dt_staleness:
+            if dt is None or cold_start is None or confidence is None:
+                raise ValueError("use_dt_staleness=True требует dt, cold_start и confidence")
+            dt_log = torch.log1p(dt)
+            components = [dt_log, cold_start, confidence]
+            if extra_staleness:
+                components.extend(extra_staleness)
+            parts.append(torch.stack(components, dim=-1))
+        if spatial is not None:
+            parts.append(spatial)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=-1)
 
     def forward(self, u_seq: torch.Tensor, h0: torch.Tensor | None = None):
         """
@@ -263,5 +303,108 @@ class GRUProbeBaseline(nn.Module):
         outputs = []
         for t in range(T):
             h = self.cell(u_seq[:, t], h)
+            outputs.append(self.readout(h))
+        return torch.stack(outputs, dim=1), h
+
+
+class ODELSTMProbeBaseline(nn.Module):
+    """
+    Настоящий (не closed-form) ODE-RNN baseline — 5-я конфигурация, TZ_stage2_efficiency_
+    and_baseline_validation.md §2. Закрывает вопрос: теряет ли CfC-B точность именно из-за
+    closed-form приближения (Hasani et al. 2022) относительно настоящего численного
+    интегрирования, на данных ЭТОГО проекта (нерегулярный Δt + disocclusion-скачки).
+
+    НЕ голый Neural ODE (`dh/dt = f_θ(h,t)`, ODE-RNN) — по §2.1 ТЗ статья самого CfC
+    (Extended Data Fig. 5) и Lechner & Hasani 2020 (arXiv 2006.04418) показывают, что голый
+    ODE-RNN проваливается на нерегулярной выборке из-за vanishing/exploding gradient
+    НЕЗАВИСИМО от солвера — это была бы патология обучения, а не честный тест архитектуры.
+    Здесь — ODE-LSTM (Lechner & Hasani 2020): архитектура, устойчивая к этой патологии,
+    но всё ещё использующая настоящее численное интегрирование (не аналитическую формулу,
+    как CfC). Портировано с `torch_node_cell.py:ODELSTMCell` (репозиторий mlech26l/ode-lstms,
+    официальная реализация авторов) под конвенции этого проекта.
+
+    Механизм (в отличие от CfC-B, где обе кандидатные ветви видят h_prev через общий
+    backbone и гейт σ_τ только смешивает — TZ_stage1c §5):
+    1. nn.LSTMCell делает ДИСКРЕТНОЕ обновление (new_h, new_c) = lstm(u_t, (h_prev, c_prev))
+       при поступлении наблюдения — cell state `c` НЕ эволюционирует численно между
+       наблюдениями (остаётся дискретным) — это и даёт устойчивый путь градиента (в отличие
+       от голого ODE-RNN, где всё состояние эволюционирует через ОДУ).
+    2. Только new_h эволюционирует ВПЕРЁД по времени на dt_t через fixed-step RK4
+       (f_node: 2-слойный MLP, Tanh посередине), 3 под-шага (`dt/3`, как в референсе —
+       "3 unfolds").
+    3. Readout: Linear(hidden_dim, obs_dim) от эволюционировавшего h на каждом шаге.
+
+    Δt здесь НЕ опциональная честная фича (как у NRD-style/NRC-style/GRU-Δt, где есть
+    faithful-версия без неё) — continuous-evolution фаза архитектурно требует Δt всегда,
+    поэтому faithful-варианта (без Δt) для этой архитектуры не существует в принципе.
+    Единственная честная ось сравнения с CfC-B — доступ к staleness-вектору
+    [cold_start, confidence, disocclusion_flag, geometric_mismatch_score] сверх obs, как и
+    у остальных honest-baseline'ов (симметрия input_dim с CfCProbeModule.build_input).
+    """
+
+    def __init__(self, obs_dim: int = 1, hidden_dim: int = 32, use_staleness: bool = True,
+                 staleness_dim: int = 2, rk4_substeps: int = 3, spatial_dim: int = 0):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.hidden_dim = hidden_dim
+        self.use_staleness = use_staleness
+        self.staleness_dim = staleness_dim
+        self.rk4_substeps = rk4_substeps
+        # spatial_dim (2026-08-20, models/spatial_features.py) — см. NRCStyleBaseline.__init__
+        # докстринг-комментарий (§2.2 ТЗ требует симметрии input_dim с CfC-B/NRC-honest/
+        # GRU-honest, spatial_dim не исключение).
+        self.spatial_dim = spatial_dim
+
+        input_dim = obs_dim + (staleness_dim if use_staleness else 0) + spatial_dim
+        self.lstm = nn.LSTMCell(input_dim, hidden_dim)
+        # f_node: 1 hidden layer NODE, точная структура ODELSTMCell.f_node из референса
+        self.f_node = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.readout = nn.Linear(hidden_dim, obs_dim)
+
+    # build_input — идентичен NRCStyleBaseline.build_input по сигнатуре (тот же формат
+    # staleness-вектора, что видят CfC-B/NRC-honest/GRU-honest — для честного сравнения)
+    build_input = staticmethod(NRCStyleBaseline.build_input)
+
+    def _rk4_evolve(self, h: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        """dt: [B, 1] — эволюционирует h вперёд на dt через fixed-step RK4, rk4_substeps
+        под-шагов (как solve_fixed в референсе: 3 unfolds по dt/3 каждый)."""
+        step = dt / self.rk4_substeps
+        for _ in range(self.rk4_substeps):
+            k1 = self.f_node(h)
+            k2 = self.f_node(h + k1 * step * 0.5)
+            k3 = self.f_node(h + k2 * step * 0.5)
+            k4 = self.f_node(h + k3 * step)
+            h = h + step * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+        return h
+
+    def forward(
+        self,
+        u_seq: torch.Tensor,
+        dt_seq: torch.Tensor,
+        h0: torch.Tensor | None = None,
+        c0: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        u_seq:  [B, T, input_dim] (см. build_input)
+        dt_seq: [B, T] или [B, T, 1] — Δt, АРХИТЕКТУРНО обязателен (не опция, см. докстринг)
+        h0/c0:  [B, hidden_dim] или None (нулевое состояние — cold-start)
+        Returns: (pred_seq, h_final) — тот же интерфейс, что CfCProbeModule.forward/
+                 GRUProbeBaseline.forward, для единообразного вызова из train_model_dense/
+                 predict_dense.
+        """
+        if dt_seq.dim() == 3:
+            dt_seq = dt_seq.squeeze(-1)  # [B, T]
+        B, T, _ = u_seq.shape
+        h = h0 if h0 is not None else torch.zeros(B, self.hidden_dim, device=u_seq.device, dtype=u_seq.dtype)
+        c = c0 if c0 is not None else torch.zeros(B, self.hidden_dim, device=u_seq.device, dtype=u_seq.dtype)
+
+        outputs = []
+        for t in range(T):
+            h, c = self.lstm(u_seq[:, t], (h, c))
+            h = self._rk4_evolve(h, dt_seq[:, t].unsqueeze(-1))
             outputs.append(self.readout(h))
         return torch.stack(outputs, dim=1), h
