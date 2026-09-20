@@ -108,7 +108,7 @@ def evaluate_interpolation(dataset, seqs, model, eval_idx, query_times, device):
         beliefs = {p: _predict_probe_belief_at(model, seqs[p], qt, device) for p in eval_idx}
         beliefs = {p: b for p, b in beliefs.items() if b is not None}
         if len(beliefs) < 2:
-            continue  # некого интерполировать друг по другу на этом query_t
+            continue  # некого интерполировать друг по друга на этом query_t
         frame_idx = int(np.argmin(np.abs(frame_ts - qt)))
         for i in beliefs:
             others = [k for k in beliefs if k != i]
@@ -156,7 +156,7 @@ def _reconstruct_light_schedule(total_duration=400.0, seed=0):
 def _run_one_seed(dataset, light_schedule, total_duration, seed, n_train_probes, epochs, lr,
                    hidden_dim, device, verbose=True):
     """Один 'сид' на РЕАЛЬНЫХ данных = один subsample-поток + одно train/eval разбиение
-    проб поверх ОДНОГО И ТОГО ЖЕ Blender-рендера (см. ограничение в докстринге модуля —
+    проб поверх ОДНИМ И ТЕМ ЖЕ Blender-рендером (см. ограничение в докстринге модуля —
     это НЕ независимая сцена). seed управляет ОБОИМИ: ProbeSubsampleConfig(seed=seed) и
     перестановкой проб для train/eval split (не фиксированный first-N/last-M — иначе
     все 'сиды' делили бы пробы ОДИНАКОВО, и единственным источником вариации был бы
@@ -326,6 +326,24 @@ def _summarize(model_kinds, preds, true, seg_offset_per_probe, n_eval_probes, ve
     тем же способом, каким synthetic-путь усредняет по кадрам) -> одно число на весь eval."""
     results = {}
     for kind in model_kinds:
+        if kind not in preds:
+            # ВРЕМЕННЫЙ ФИКС (2026-08-28, methodology plan — блокировал run_multi_seed()
+            # целиком на каждом вызове, включая вне тестов): `cfc_mmrnn` добавлен
+            # в MODEL_KINDS (run_experiment_dense.py, 2026-08-22, TZ_stage3_cfc_mmrnn.md), но
+            # обучается/предсказывается ТОЛЬКО через отдельный run_cfc_mmrnn.py, не
+            # через _run_one_seed()/preds здесь — уже было зафиксировано как
+            # известное, не исправленое "побочное" в EXPERIMENT_LOG.md до этой сессии.
+            # НАСТОЯЩИЙ ФИКС лишь даёт таким kind дойти NaN-заполненным вместо KeyError,
+            # чтобы run_multi_seed() мог завершиться для ВСЕХ остальных kind — НЕ чинит
+            # саму интеграцию cfc_mmrnn (отдельная задача, вне скопа этого ТЗ).
+            # TODO: либо прописать cfc_mmrnn в _run_one_seed()/preds, либо убрать его из
+            # MODEL_KINDS для этого пути — решить отдельно, не в рамках methodology plan.
+            results[kind] = dict(
+                early=float("nan"), floor=float("nan"),
+                per_segment_type={name: float("nan") for name in SEGMENT_TYPE_NAMES},
+                curve={label: float("nan") for label in BIN_LABELS},
+            )
+            continue
         early_vals, floor_vals = [], []
         seg_mse_accum = {name: [] for name in SEGMENT_TYPE_NAMES}
         curve_accum = {label: [] for label in BIN_LABELS}
