@@ -92,81 +92,18 @@ SEGMENT_TYPE_NAMES = list(SEGMENT_NAMES.values())
 
 DEFAULT_DATASET = Path(__file__).parent / "blender" / "generate_dataset_dense_result_full.npz"
 
-# Позиционное кондиционирование (2026-08-20, чат/mempalace) — фиксированная
-# размерность spatial-входа для ВСЕХ "_spatial" конфигураций (единая точка, не
-# пересчитывается по месту вызова, чтобы __init__ модели и build_input использовали заведомо одно
-# и то же число). roughness не передаётся (include_roughness=False) — в текущей Blender-сцене
-# это константа (Roughness=1.0, одна общая материал), не рендерится отдельным буфером (см. models/
-# spatial_features.py докстринг).
 SPATIAL_DIM = _spatial_dim_fn(n_freqs_position=4, n_freqs_direction=2, include_roughness=False)
 
-# Масштаб сцены для нормализации position перед positional encoding (2026-08-20 багфикс,
-# см. models/spatial_features.py::build_spatial_conditioning докстринг position_scale).
-# blender/generate_dataset_dense.py::build_static_geometry — bpy.ops.mesh.primitive_plane_add(
-# size=8) -> пол простирается от -4 до +4 по x/y -> половина протяжённости = 4.0.
 FLOOR_HALF_EXTENT = 4.0
 
 MODEL_KINDS = ["cfc", "cfc_hardjump", "cfc_hardjump_skip", "cfc_mmrnn", "nrd_faithful",
                "nrd_honest", "nrc_faithful", "nrc_honest", "gru_faithful", "gru_honest",
                "ode_lstm_honest", "cfc_spatial", "nrc_honest_spatial", "gru_honest_spatial",
                "ode_lstm_spatial"]
-# SKIP_KINDS (31.08.2026, чат) — гипотеза триумвирата с ODE-LSTM опровергнута
-# (paired bootstrap по warp_age, n=16, dt1.npz — ode_lstm_honest нигде не превосходит
-# nrc_honest значимо, значимо хуже сразу после disocclusion; см. mempalace). ode_lstm_*
-# на порядок дороже остальных моделей (RK4) и больше не нужен в продакшн-прогонах —
-# --skip_kinds позволяет пропустить его обучение (и обучение любых других MODEL_KINDS)
-# не трогая остальной пайплайн. Пропущенные kind'ы просто отсутствуют в preds (тот же
-# паттерн, что уже используется для cfc_mmrnn — см. guard в _summarize/_summarize_
-# disocclusion), их метрики в summary выводятся как nan. По умолчанию пусто (обратная
-# совместимость).
 SKIP_KINDS = set()
-
-# *_spatial (2026-08-20, чат/mempalace) — те же 4 честные конфигурации с общими весами
-# (cfc/nrc_honest/gru_honest/ode_lstm_honest), плюс позиционное кондиционирование (models/
-# spatial_features.py::build_spatial_conditioning — позиция+направление+normal+albedo,
-# positional encoding, §5.2 Müller et al. 2021). Применено ОДИНАКОВО ко всем четырём (не
-# только к nrc/cfc) — решение из чата: иначе разница cfc vs honest была бы смесью
-# "closed-form преимущество" и "доступ к позиции", а не изолированным тестом ни одного из
-# двух вопросов (а)/(б). nrd_* и *_faithful сюда не входят (NRD — 0 обучаемых параметров,
-# кондиционировать нечего; *_faithful по определению не видит ничего сверх obs; добавление spatial
-# сделало бы его наполовину honest, смешивая вопросы (а)/(б), см. models/baselines.py доктрины).
-# cfc_hardjump_skip (2026-08-19, models/temporal/cfc_probe_module.py::use_jump_output_skip):
-# та же cfc_hardjump (h/jump_map/рекуррентная динамика НЕ меняются), но на шаге disocclusion=1
-# предсказание — out_t = obs_t + zero-init residual(h_jump), а не readout(h_jump) через две
-Tanh-прослойки с нуля. Проверяет найденный разрыв с NRDStyleBaseline.use_disocclusion_reset
-# (out_t=obs_t, ноль параметров) — cfc_hardjump статистически значимо ХУЖЕ nrd_honest на
-# disocclusion (см. mempalace), гипотеза: разрыв инженерный (нет прямого пути к obs_t), не
-# архитектурный. Если cfc_hardjump_skip закрывает разрыв с nrd_honest — гипотеза подтверждена.
-# cfc_hardjump (2026-08-16, ablation по Krach et al. 2022 / Herrera et al. 2021, см. mempalace):
-# та же CfCProbeModule, но с use_hard_jump_reset=True — на шагах disocclusion=1 состояние
-# ПОЛНОСТЬЮ заменяется отдельной MLP от u_t (NJ-ODE-style жёсткий jump, вес 1), а не смешивается
-# через sigma_tau. Проверяет гипотезу "у CfC-B нет отдельного hard-reset примитива" напрямую —
-# если disocc_mse(cfc_hardjump) << disocc_mse(cfc) и приближается к nrc_honest, гипотеза
-# подтверждена; если нет — узкое место не в отсутствии jump-канала как такового.
-#
-# cfc_mmrnn (2026-08-22, TZ_stage3_cfc_mmrnn.md, models/temporal/cfc_probe_module.py::
-# use_mixed_memory): та же cfc_hardjump_skip (disocclusion уже закрыт, не трогаем) ПЛЮС
-mixed-memory RNN буфер (Lechner & Hasani, OpenReview rOGm97YR22N/NeurIPS 2022) — LSTM
-# ПЕРЕД CfC-шагом каждый раз, отдельный c_state, никогда не проходящий через continuous-
-# time часть. Цель — STABLE-срез (не disocclusion): cfc_hardjump_skip сравнялся с nrc_honest
-# на disocclusion, но остался значимо хуже nrd_honest/gru_honest на stable (см. mempalace,
-# 2026-08-19) — проверяем гипотезу "это vanishing/exploding gradient на длинных сегментах,
-# то, что чинит именно mmRNN" против альтернативы "узкое место не в этом". На disocclusion
-# (TZ_stage3 §3.2, Вариант A): c_state тоже жёстко сбрасывается через jump_map, тем же
-# принципом, что и h — см. докстринг forward() в cfc_probe_module.py.
-#
-# ode_lstm_honest (2026-08-18, TZ_stage2_efficiency_and_baseline_validation.md §2.2):
-# ODELSTMProbeBaseline (models/baselines.py) — настоящий numerical-integration ODE-RNN
-# baseline (ODE-LSTM, Lechner & Hasani 2020), не closed-form как CfC-B. Только honest-версия
-# (Δt архитектурно обязателен для этой модели — см. докстринг класса, faithful-вариант без
-# Δt не имеет смысла в отличие от NRD/NRC/GRU). Отвечает на вопрос §2: теряет ли CfC-B
-# точность именно из-за closed-form приближения относительно настоящего интегрирования.
 
 
 def load_fully_valid_pixel_sequences(npz_path):
-    """build_all_pixel_sequences (blender/dataset_adapter_dense.py) без
-    изменений + фильтр на "валиден на ВСЕХ кадрах" (см. докстринг
-    модуля про причину)."""
     seqs = build_all_pixel_sequences(npz_path)
     filtered = [s for s in seqs if s["valid"].all()]
     print(f"пикселей всего с последовательностью: {len(seqs)}, "
@@ -175,12 +112,6 @@ def load_fully_valid_pixel_sequences(npz_path):
 
 
 def build_batch_dense(seqs, indices):
-    """build_batch (run_experiment.py) БЕЗ ИЗМЕНЕНИЙ для obs/dt/cold/
-    conf/true/t (ключи совпадают — dataset_adapter_dense.py намеренно
-    использует ту же номенклатуру, что probe_subsampling.py/
-    dataset_adapter.py) + доп. dense-специфичные каналы
-    (disocclusion_flag/geometric_mismatch_score/valid), обрезанные до
-    той же длины T, что вычислил build_batch."""
     batch = _build_batch_base(seqs, indices)
     T = batch["dt"].shape[1]
     batch["disocclusion_flag"] = torch.tensor(
@@ -192,9 +123,6 @@ def build_batch_dense(seqs, indices):
     batch["valid"] = torch.tensor(
         np.stack([seqs[i]["valid"][:T] for i in indices]), dtype=torch.bool,
     )
-    # Позиционное кондиционирование (2026-08-20, чат) — сырые буферы, ЕЩЁ БЕЗ positional
-    # encoding (encoding применяется позже, в _get_spatial(), одинаково при train и predict,
-    # models/spatial_features.py::build_spatial_conditioning).
     batch["position"] = torch.tensor(
         np.stack([seqs[i]["position"][:T] for i in indices]), dtype=torch.float32,
     )
@@ -211,14 +139,6 @@ def build_batch_dense(seqs, indices):
 
 
 def _get_spatial(batch, device):
-    """Единая точка сборки spatial-входа (2026-08-20, чат) — вызывается ОДИНАКОВО
-    из train_model_dense/predict_dense для всех "_spatial" конфигураций, чтобы positional
-    encoding (n_freqs_position/n_freqs_direction/position_scale) не разъехался между
-    train и eval. position_scale=FLOOR_HALF_EXTENT (2026-08-20 багфикс, см. models/
-    spatial_features.py докстринг position_scale — без нормализации positional encoding
-    алиасировался на сырых мировых координатах пола, 4.5x больше данных эту
-    деградацию не лечило, что и подтвердило: дело в масштабе encoding'а, не в объёме
-    выборки)."""
     return build_spatial_conditioning(
         batch["position"].to(device), batch["direction"].to(device),
         batch["normal"].to(device), batch["albedo"].to(device),
@@ -226,18 +146,6 @@ def _get_spatial(batch, device):
     )
 
 
-
-# Модели без развитой recurrence (per-frame независимые MLP/GRU-cell на маленьких
-# матрицах) — 2026-08-24 (стресс-тест n_seeds=16, чат): MPS-бэкенд документированно не
-# гарантирует детерминизм даже при фиксированном torch.manual_seed (github.com/pytorch/
-# pytorch#97236, module:determinism+module:mps; PyTorch Reproducibility notes — atomic-
-# операции в reduction-ядрах не имеют фиксированного порядка суммирования). Эмпирически
-# обнаружено: nrc_honest даёt РАЗНЫЕ per-seed числа между двумя прогонами на одинаковых
-# сидах (nrc_honest stable seed0: 0.0169 vs 0.0221), тогда как cfc_mmrnn/cfc_hardjump_skip
-# воспроизводятся побитово. Все модели в этом множестве дёшевы (<1с/сид на nrc/nrd, ~40с на
-# gru) — форсируем CPU для них конкретно, что убирает MPS-недетерминизм почти бесплатно по
-# времени, вместо общего torch.use_deterministic_algorithms(True) (неполная поддержка MPS,
-# может падать на неподдерживаемых операциях).
 _FORCE_CPU_KINDS = {
     "nrc_honest", "nrc_faithful", "nrc_honest_spatial",
     "gru_honest", "gru_faithful", "gru_honest_spatial",
@@ -246,24 +154,6 @@ _FORCE_CPU_KINDS = {
 
 def train_model_dense(kind: str, batch, device, epochs: int, lr: float, hidden_dim: int,
                        gate_lr: float | None = None):
-    """Аналог train_model (run_experiment.py) — honest-версии получают
-    staleness_dim=4/extra_staleness_dim=2 с extra_staleness=
-    [disocclusion_flag, geometric_mismatch_score] (§2.6/§4.2) вместо
-    старого 2-/3-элементного вектора. nrd_faithful/nrd_honest сюда не
-    попадают — у NRDStyleBaseline нет обучаемых параметров (как и в
-    train_model для probe-пути).
-
-    gate_lr (только для kind='cfc', МОЙ инженерный эксперимент, не из
-    ТЗ, 2026-08-09): отдельный learning rate для model.cell.W_a/W_b
-    (time-gate readout) поверх общего lr для всей остальной сети.
-    Мотивация — эмпирическая, не догадка: gate-диагностика (см.
-    mempalace) показала, что backbone z РЕАЛЬНО различает disocclusion/
-    stable контексты (cos_sim=0.886, не ~1.0), но W_a/W_b не
-    конвертируют это различие в разный sigma_tau — а их градиент на
-    порядок меньше остального backbone (0.0038/0.0018 vs 0.063/0.023).
-    None (по умолчанию) = старое поведение, единый lr на все параметры,
-    один Adam без param groups.
-    """
     if kind in _FORCE_CPU_KINDS:
         device = torch.device("cpu")
     obs, dt = batch["obs"].to(device), batch["dt"].to(device)
@@ -279,17 +169,12 @@ def train_model_dense(kind: str, batch, device, epochs: int, lr: float, hidden_d
         calibrate_time_gate_init(model, u, dt, target_pre_sigmoid_std=2.0)
         forward = lambda: model(u, dt)[0]
     elif kind == "cfc_hardjump":
-        # ablation (2026-08-16, см. MODEL_KINDS докстринг выше) — та же модель/калибровка/lr,
-        # что и "cfc", единственное отличие: use_hard_jump_reset=True + disocc_seq в forward.
         model = CfCProbeModule(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True,
                                 staleness_dim=4, use_hard_jump_reset=True).to(device)
         u = model.build_input(obs, cold, conf, use_staleness=True, extra_staleness=[disocc, mismatch])
         calibrate_time_gate_init(model, u, dt, target_pre_sigmoid_std=2.0)
         forward = lambda: model(u, dt, disocc_seq=disocc)[0]
     elif kind == "cfc_hardjump_skip":
-        # ablation (2026-08-19, см. MODEL_KINDS докстринг выше) — та же cfc_hardjump, плюс
-        # use_jump_output_skip=True (h/jump_map не меняются, меняется только сам оутпут на
-        # шаге disocclusion=1, см. cfc_probe_module.py).
         model = CfCProbeModule(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True,
                                 staleness_dim=4, use_hard_jump_reset=True,
                                 use_jump_output_skip=True).to(device)
@@ -297,8 +182,6 @@ def train_model_dense(kind: str, batch, device, epochs: int, lr: float, hidden_d
         calibrate_time_gate_init(model, u, dt, target_pre_sigmoid_std=2.0)
         forward = lambda: model(u, dt, disocc_seq=disocc)[0]
     elif kind == "cfc_mmrnn":
-        # ablation (2026-08-22, см. MODEL_KINDS докстринг выше / TZ_stage3_cfc_mmrnn.md) —
-        # та же cfc_hardjump_skip, плюс use_mixed_memory=True (LSTM-буфер перед CfC-шагом).
         model = CfCProbeModule(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True,
                                 staleness_dim=4, use_hard_jump_reset=True,
                                 use_jump_output_skip=True, use_mixed_memory=True).to(device)
@@ -326,19 +209,12 @@ def train_model_dense(kind: str, batch, device, epochs: int, lr: float, hidden_d
         u = GRUProbeBaseline.build_input(obs, use_dt_staleness=False)
         forward = lambda: model(u)[0]
     elif kind == "ode_lstm_honest":
-        # §2.2 TZ_stage2 — только honest (Δt архитектурно обязателен, faithful не существует
-        # для этой архитектуры), staleness_dim=4 симметрично cfc/cfc_hardjump/nrc_honest/gru_honest.
         model = ODELSTMProbeBaseline(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True,
                                       staleness_dim=4).to(device)
         u = ODELSTMProbeBaseline.build_input(obs, cold, conf, use_staleness=True,
                                               extra_staleness=[disocc, mismatch])
         forward = lambda: model(u, dt)[0]
     elif kind == "cfc_spatial":
-        # 2026-08-20 (чат) — та же cfc, плюс позиционное кондиционирование (models/
-        # spatial_features.py). calibrate_time_gate_init остаётся без изменений — она
-        # калибрует ТОЛЬКО W_a (time-gate), который спереди видит тот же расширенный z из
-        # backbone, но сам принцип калибровки (масштаб t_a*log1p(dt)) не завязан на состав
-        # входа backbone'а.
         spatial = _get_spatial(batch, device)
         model = CfCProbeModule(obs_dim=obs_dim, hidden_dim=hidden_dim, use_staleness=True,
                                 staleness_dim=4, spatial_dim=SPATIAL_DIM).to(device)
@@ -462,21 +338,9 @@ def predict_dense(kind: str, model_or_none, batch, device, tau_nrd: float = 3.0,
 
 
 def _summarize_disocclusion(model_kinds, preds, true, disocc_flags, n_eval, verbose=True):
-    """§6 delta — MSE disocclusion vs stable + error-vs-warp-age, тем же
-    способом канального усреднения (obs_dim каналов -> одно число на
-    пиксель -> одно число на весь eval), что _summarize (run_experiment_
-    blender.py) делает для static/step/drift."""
     results = {}
     for kind in model_kinds:
         if kind not in preds:
-            # ВРЕМЕННЫЙ ФИКС (2026-08-28, methodology plan) — тот же случай, что в аналогичном
-            # гарде в _summarize() (run_experiment_blender.py): `cfc_mmrnn` есть в MODEL_KINDS, но
-            # НЕ вызывается в preds выше в _run_one_seed() (train_model_dense/predict_dense ЕГО
-            # уже умеют, но вызов для него там не добавлен — cfc_mmrnn обучается/оценивается
-            # только через отдельный run_cfc_mmrnn.py). Уже было зафиксировано как
-            # известное, не исправленное "побочное" в EXPERIMENT_LOG.md до этой сессии.
-            # TODO: либо прописать cfc_mmrnn в _run_one_seed()/preds, либо убрать его из
-            # MODEL_KINDS для этого пути — решить отдельно, не в рамках methodology plan.
             results[kind] = dict(
                 disocclusion=float("nan"), stable=float("nan"),
                 warp_age_curve={label: float("nan") for label in BIN_LABELS},
@@ -485,7 +349,7 @@ def _summarize_disocclusion(model_kinds, preds, true, disocc_flags, n_eval, verb
         disocc_vals, stable_vals = [], []
         curve_accum = {label: [] for label in BIN_LABELS}
         for p in range(n_eval):
-            pred_p = preds[kind][p].astype(np.float64)  # [T, C]
+            pred_p = preds[kind][p].astype(np.float64)
             true_p = true[p].astype(np.float64)
             flag_p = disocc_flags[p].astype(bool)
 
@@ -526,12 +390,6 @@ def _summarize_disocclusion(model_kinds, preds, true, disocc_flags, n_eval, verb
 
 
 def _aggregate_gate_diag(diag_list: list[dict]) -> dict:
-    """Усредняет gate-диагностику (full_gate_diagnostics) ПО СИДАМ в одну строку —
-    2026-08-11, TZ_stage1b_gate_theory_sweep.md §2/§6.2: sweep по gate_lr должен давать
-    ОДНУ сравнимую строку на конфиг, а не список из n_seeds отдельных словарей. Простое
-    среднее по сидам (не взвешенное по n) — n_train_pixels фиксирован по ТЗ §6.1, поэтому
-    n по группам varies минимально между сидами (только из-за случайного train/eval split).
-    """
     def _mean_field(get_group_dict, group_key, field):
         vals = [get_group_dict(d)[group_key][field] for d in diag_list
                  if group_key in get_group_dict(d)]
@@ -539,21 +397,18 @@ def _aggregate_gate_diag(diag_list: list[dict]) -> dict:
 
     agg = dict(n_seeds=len(diag_list))
 
-    # top-level (агрегат по ВСЕМ шагам, без разбивки на группы)
     agg["sigma_tau_mean"] = float(np.mean([d["sigma_tau"]["mean"] for d in diag_list]))
     agg["sat_low_frac"] = float(np.mean([d["sigma_tau"]["sat_low(<0.02)"] for d in diag_list]))
     agg["sat_high_frac"] = float(np.mean([d["sigma_tau"]["sat_high(>0.98)"] for d in diag_list]))
     agg["t_a_abs_mean"] = float(np.mean([d["t_a_dt_scale"]["t_a_abs_mean"] for d in diag_list]))
     agg["t_b_abs_mean"] = float(np.mean([abs(d["t_b=W_b(z)"]["mean"]) for d in diag_list]))
 
-    # градиентная норма W_a/W_b относительно backbone (§6.2 требование ТЗ)
     for layer in ("backbone", "W_a", "W_b"):
         w = [d["grad"][layer]["weight_grad_norm"] for d in diag_list if d.get("grad")]
         b = [d["grad"][layer]["bias_grad_norm"] for d in diag_list if d.get("grad")]
         agg[f"grad_{layer}_weight_norm"] = float(np.mean(w)) if w else float("nan")
         agg[f"grad_{layer}_bias_norm"] = float(np.mean(b)) if b else float("nan")
 
-    # разбивка (seg_type × disocclusion_flag) — ГЛАВНОЕ для H1/H2 (§6.3 ТЗ)
     all_joint_keys = set()
     for d in diag_list:
         all_joint_keys.update(d.get("by_seg_type_x_disocclusion", {}).keys())
@@ -568,7 +423,6 @@ def _aggregate_gate_diag(diag_list: list[dict]) -> dict:
         )
     agg["by_seg_type_x_disocclusion"] = by_joint
 
-    # маргинал по disocclusion (§1 by_disocclusion) — для H1/H2 на более грубом уровне
     all_disocc_keys = set()
     for d in diag_list:
         all_disocc_keys.update(d.get("by_disocclusion", {}).keys())
@@ -588,13 +442,6 @@ def _aggregate_gate_diag(diag_list: list[dict]) -> dict:
 
 def _train_with_progress(kind, seed, n_seeds, train_batch, device, epochs, lr, hidden_dim,
                           gate_lr=None, verbose=True):
-    """Обёртка над train_model_dense с печатью прогресса по этапам (не по эпохам —
-    train_model_dense не даёт хуков внутрь цикла эпох) — ode_lstm_honest на порядок
-    дороже остальных (RK4, rk4_substeps forward-проходов f_node на шаг вместо одного),
-    поэтому без этого печать вида выглядит как зависание на несколько минут.
-
-    31.08.2026 (чат) — если kind в SKIP_KINDS, обучение полностью пропускается,
-    возвращается None (см. докстринг SKIP_KINDS)."""
     if kind in SKIP_KINDS:
         if verbose:
             print(f"  [seed {seed+1}/{n_seeds}] {kind} — пропущено (SKIP_KINDS)", flush=True)
@@ -611,9 +458,376 @@ def _train_with_progress(kind, seed, n_seeds, train_batch, device, epochs, lr, h
 
 def _run_one_seed(seqs, light_schedule, seed, n_train_pixels, epochs, lr, hidden_dim, device,
                    verbose=True, gate_lr=None, n_seeds=1):
-    """Один 'сид' = train/eval разбиение ПИКСЕЛЕЙ поверх ОДНИМ и тем
-    же рендером (см. предупреждение в докстринге модуля — Δt регулярный,
-    значит здесь нет второй оси вариации, которая была в probe-пути
-    через per-probe subsampling): — обрезано, остновок дальше идет путём сильного—
+    n_pixels = len(seqs)
+    if n_train_pixels >= n_pixels:
+        raise ValueError(f"n_train_pixels={n_train_pixels} >= доступно валидных пикселей={n_pixels}")
 
-... (обрезано, лимит вывода инструмента)
+    set_determinism(seed)
+
+    perm = np.random.default_rng(seed).permutation(n_pixels)
+    train_idx = list(perm[:n_train_pixels])
+    eval_idx = list(perm[n_train_pixels:])
+
+    train_batch = build_batch_dense(seqs, train_idx)
+    eval_batch = build_batch_dense(seqs, eval_idx)
+
+    cfc_model = _train_with_progress("cfc", seed, n_seeds, train_batch, device, epochs, lr,
+                                      hidden_dim, gate_lr=gate_lr, verbose=verbose)
+    cfc_hardjump_model = _train_with_progress("cfc_hardjump", seed, n_seeds, train_batch, device,
+                                               epochs, lr, hidden_dim, verbose=verbose)
+    cfc_hardjump_skip_model = _train_with_progress("cfc_hardjump_skip", seed, n_seeds, train_batch,
+                                                    device, epochs, lr, hidden_dim, verbose=verbose)
+    nrc_f_model = _train_with_progress("nrc_faithful", seed, n_seeds, train_batch, device,
+                                        epochs, lr, hidden_dim, verbose=verbose)
+    nrc_h_model = _train_with_progress("nrc_honest", seed, n_seeds, train_batch, device,
+                                        epochs, lr, hidden_dim, verbose=verbose)
+    gru_f_model = _train_with_progress("gru_faithful", seed, n_seeds, train_batch, device,
+                                        epochs, lr, hidden_dim, verbose=verbose)
+    gru_h_model = _train_with_progress("gru_honest", seed, n_seeds, train_batch, device,
+                                        epochs, lr, hidden_dim, verbose=verbose)
+    ode_lstm_model = _train_with_progress("ode_lstm_honest", seed, n_seeds, train_batch, device,
+                                           epochs, lr, hidden_dim, verbose=verbose)
+    cfc_spatial_model = _train_with_progress("cfc_spatial", seed, n_seeds, train_batch, device,
+                                              epochs, lr, hidden_dim, verbose=verbose)
+    nrc_spatial_model = _train_with_progress("nrc_honest_spatial", seed, n_seeds, train_batch,
+                                              device, epochs, lr, hidden_dim, verbose=verbose)
+    gru_spatial_model = _train_with_progress("gru_honest_spatial", seed, n_seeds, train_batch,
+                                              device, epochs, lr, hidden_dim, verbose=verbose)
+    ode_lstm_spatial_model = _train_with_progress("ode_lstm_spatial", seed, n_seeds, train_batch,
+                                                   device, epochs, lr, hidden_dim, verbose=verbose)
+
+    train_seg_type = np.stack([
+        label_samples(train_batch["t"][i].astype(np.float64), light_schedule)[0]
+        for i in range(len(train_idx))
+    ])
+    u_train = cfc_model.build_input(
+        train_batch["obs"].to(device), train_batch["cold"].to(device),
+        train_batch["conf"].to(device), use_staleness=True,
+        extra_staleness=[train_batch["disocclusion_flag"].to(device),
+                          train_batch["geometric_mismatch_score"].to(device)],
+    )
+    gate_diag = full_gate_diagnostics(
+        cfc_model, u_train, train_batch["dt"].to(device), true=train_batch["true"].to(device),
+        seg_type=train_seg_type, segment_names=SEGMENT_NAMES,
+        disocclusion_flag=train_batch["disocclusion_flag"].to(device),
+        label=f"seed={seed} (train, dense)",
+    )
+
+    preds = {
+        "cfc": predict_dense("cfc", cfc_model, eval_batch, device),
+        "cfc_hardjump": predict_dense("cfc_hardjump", cfc_hardjump_model, eval_batch, device),
+        "cfc_hardjump_skip": predict_dense("cfc_hardjump_skip", cfc_hardjump_skip_model,
+                                            eval_batch, device),
+        "nrd_faithful": predict_dense("nrd_faithful", None, eval_batch, device),
+        "nrd_honest": predict_dense("nrd_honest", None, eval_batch, device),
+        "nrc_faithful": predict_dense("nrc_faithful", nrc_f_model, eval_batch, device),
+        "nrc_honest": predict_dense("nrc_honest", nrc_h_model, eval_batch, device),
+        "gru_faithful": predict_dense("gru_faithful", gru_f_model, eval_batch, device),
+        "gru_honest": predict_dense("gru_honest", gru_h_model, eval_batch, device),
+        "nrc_honest_spatial": predict_dense("nrc_honest_spatial", nrc_spatial_model, eval_batch, device),
+    }
+    for _kind, _model in (
+        ("ode_lstm_honest", ode_lstm_model),
+        ("ode_lstm_spatial", ode_lstm_spatial_model),
+        ("cfc_spatial", cfc_spatial_model),
+        ("gru_honest_spatial", gru_spatial_model),
+    ):
+        if _model is not None:
+            preds[_kind] = predict_dense(_kind, _model, eval_batch, device)
+    true = eval_batch["true"].numpy()
+    t_arr = eval_batch["t"]
+    disocc_flags = eval_batch["disocclusion_flag"].numpy()
+
+    seg_offset_per_pixel = [
+        label_samples(t_arr[p].astype(np.float64), light_schedule)
+        for p in range(len(eval_idx))
+    ]
+    results = _summarize(MODEL_KINDS, preds, true, seg_offset_per_pixel, len(eval_idx), verbose=verbose)
+    disocc_results = _summarize_disocclusion(MODEL_KINDS, preds, true, disocc_flags, len(eval_idx),
+                                              verbose=verbose)
+    for kind in MODEL_KINDS:
+        results[kind]["disocclusion"] = disocc_results[kind]["disocclusion"]
+        results[kind]["stable"] = disocc_results[kind]["stable"]
+        results[kind]["warp_age_curve"] = disocc_results[kind]["warp_age_curve"]
+
+    results["_gate_diag"] = gate_diag
+
+    return results
+
+
+def run(dataset_path=DEFAULT_DATASET, n_train_pixels=20, epochs=200, lr=1e-3, hidden_dim=32,
+        seed=0, light_schedule_total_duration=400.0, light_schedule_seed=0, gate_lr=None):
+    seqs = load_fully_valid_pixel_sequences(dataset_path)
+    light_schedule = _reconstruct_light_schedule(light_schedule_total_duration, light_schedule_seed)
+    device = _select_device()
+    print(f"device: {device}")
+    return _run_one_seed(seqs, light_schedule, seed, n_train_pixels, epochs, lr, hidden_dim, device,
+                          gate_lr=gate_lr, n_seeds=1)
+
+
+def run_multi_seed(dataset_path=DEFAULT_DATASET, n_seeds=8, n_train_pixels=20, epochs=200,
+                    lr=1e-3, hidden_dim=32, light_schedule_total_duration=400.0,
+                    light_schedule_seed=0, verbose_per_seed=True, gate_lr=None,
+                    force_all_cpu=False):
+    if n_seeds < MIN_N_SEEDS:
+        raise ValueError(f"n_seeds={n_seeds} < {MIN_N_SEEDS} (§6.4)")
+    seqs = load_fully_valid_pixel_sequences(dataset_path)
+    light_schedule = _reconstruct_light_schedule(light_schedule_total_duration, light_schedule_seed)
+    device = torch.device("cpu") if force_all_cpu else _select_device()
+    env_meta = capture_env_metadata(device)
+    print(f"device: {device}  (backend={env_meta['backend']}, force_all_cpu={force_all_cpu})")
+
+    early_by_kind = {k: [] for k in MODEL_KINDS}
+    floor_by_kind = {k: [] for k in MODEL_KINDS}
+    segtype_by_kind = {k: {name: [] for name in SEGMENT_TYPE_NAMES} for k in MODEL_KINDS}
+    disocc_by_kind = {k: [] for k in MODEL_KINDS}
+    stable_by_kind = {k: [] for k in MODEL_KINDS}
+    warp_age_by_kind = {k: {label: [] for label in BIN_LABELS} for k in MODEL_KINDS}
+    gate_diag_by_seed = []
+
+    for seed in range(n_seeds):
+        print(f"\n--- seed {seed+1}/{n_seeds} ---", flush=True)
+        results = _run_one_seed(seqs, light_schedule, seed, n_train_pixels, epochs, lr,
+                                 hidden_dim, device, verbose=verbose_per_seed, gate_lr=gate_lr,
+                                 n_seeds=n_seeds)
+        for kind in MODEL_KINDS:
+            r = results[kind]
+            early_by_kind[kind].append(r["early"])
+            floor_by_kind[kind].append(r["floor"])
+            for name in SEGMENT_TYPE_NAMES:
+                segtype_by_kind[kind][name].append(r["per_segment_type"][name])
+            disocc_by_kind[kind].append(r["disocclusion"])
+            stable_by_kind[kind].append(r["stable"])
+            for label in BIN_LABELS:
+                warp_age_by_kind[kind][label].append(r["warp_age_curve"][label])
+        gate_diag_by_seed.append(results["_gate_diag"])
+        print(f"seed {seed}: disocclusion(cfc)={disocc_by_kind['cfc'][-1]:.4f} "
+              f"stable(cfc)={stable_by_kind['cfc'][-1]:.4f}")
+
+    print("\n=== summary (mean over seeds): early / floor ===")
+    for kind in MODEL_KINDS:
+        print(f"{kind:14s}  early={np.nanmean(early_by_kind[kind]):.4f}  "
+              f"floor={np.nanmean(floor_by_kind[kind]):.4f}")
+
+    print("\n=== summary (mean over seeds): §6 delta — disocclusion / stable ===")
+    for kind in MODEL_KINDS:
+        print(f"{kind:14s}  disocclusion={np.nanmean(disocc_by_kind[kind]):.4f}  "
+              f"stable={np.nanmean(stable_by_kind[kind]):.4f}")
+
+    print("\n=== summary (mean over seeds): error-vs-warp-age (§6 delta) ===")
+    header = "kind".ljust(14) + "".join(lbl.rjust(11) for lbl in BIN_LABELS)
+    print(header)
+    for kind in MODEL_KINDS:
+        row = kind.ljust(14)
+        for label in BIN_LABELS:
+            val = np.nanmean(warp_age_by_kind[kind][label])
+            row += f"{val:11.4f}" if not np.isnan(val) else f"{'nan':>11s}"
+        print(row)
+
+    warp_age_pairs = [
+        ("ode_lstm_honest", "nrc_honest"),
+        ("cfc_hardjump_skip", "nrc_honest"),
+        ("cfc_hardjump_skip", "ode_lstm_honest"),
+    ]
+    for kind_a, kind_b in warp_age_pairs:
+        for label in BIN_LABELS:
+            a = np.array(warp_age_by_kind[kind_a][label])
+            b = np.array(warp_age_by_kind[kind_b][label])
+            if len(a) == 0 or len(b) == 0 or np.isnan(a).any() or np.isnan(b).any():
+                continue
+            res = paired_bootstrap_significance(a, b)
+            print(f"{kind_a} vs {kind_b} (warp_age {label}): mean_diff={res['mean_diff']:.4f} "
+                  f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    print("\n=== §5 stage1b КРИТЕРИЙ: CfC-B vs честные baseline'ы в DISOCCLUSION-СРЕЗЕ ===")
+    disocc_significance = {}
+    for honest_kind in ["nrd_honest", "nrc_honest", "gru_honest"]:
+        a = np.array(disocc_by_kind["cfc"])
+        b = np.array(disocc_by_kind[honest_kind])
+        if np.isnan(a).any() or np.isnan(b).any():
+            continue
+        res = paired_bootstrap_significance(a, b)
+        disocc_significance[honest_kind] = res
+        print(f"cfc vs {honest_kind} (disocclusion): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    hardjump_significance = {}
+    for other_kind in ["cfc", "nrd_honest", "nrc_honest", "gru_honest", "ode_lstm_honest"]:
+        a = np.array(disocc_by_kind["cfc_hardjump"])
+        b = np.array(disocc_by_kind[other_kind])
+        if np.isnan(a).any() or np.isnan(b).any():
+            continue
+        res = paired_bootstrap_significance(a, b)
+        hardjump_significance[other_kind] = res
+        print(f"cfc_hardjump vs {other_kind:12s} (disocclusion): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    skip_significance = {}
+    for other_kind in ["cfc_hardjump", "nrd_honest", "nrc_honest", "ode_lstm_honest"]:
+        a = np.array(disocc_by_kind["cfc_hardjump_skip"])
+        b = np.array(disocc_by_kind[other_kind])
+        if np.isnan(a).any() or np.isnan(b).any():
+            continue
+        res = paired_bootstrap_significance(a, b)
+        skip_significance[other_kind] = res
+        print(f"cfc_hardjump_skip vs {other_kind:12s} (disocclusion): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+    a_stable = np.array(stable_by_kind["cfc_hardjump_skip"])
+    b_stable = np.array(stable_by_kind["cfc_hardjump"])
+    if not (np.isnan(a_stable).any() or np.isnan(b_stable).any()):
+        res = paired_bootstrap_significance(a_stable, b_stable)
+        print(f"cfc_hardjump_skip vs cfc_hardjump (stable, регрессия-чек): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    stable_significance = {}
+    for honest_kind in ["nrd_honest", "nrc_honest", "gru_honest"]:
+        a = np.array(stable_by_kind["cfc"])
+        b = np.array(stable_by_kind[honest_kind])
+        if np.isnan(a).any() or np.isnan(b).any():
+            continue
+        res = paired_bootstrap_significance(a, b)
+        stable_significance[honest_kind] = res
+        print(f"cfc vs {honest_kind} (stable): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    for slice_name, by_kind in (("disocclusion", disocc_by_kind), ("stable", stable_by_kind)):
+        a = np.array(by_kind["cfc_hardjump"])
+        b = np.array(by_kind["ode_lstm_honest"])
+        if np.isnan(a).any() or np.isnan(b).any():
+            continue
+        res = paired_bootstrap_significance(a, b)
+        print(f"cfc_hardjump vs ode_lstm_honest ({slice_name}): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    for honest_kind in ["nrd_honest", "nrc_honest", "gru_honest"]:
+        res = paired_bootstrap_significance(
+            np.array(early_by_kind["cfc"]), np.array(early_by_kind[honest_kind]),
+        )
+        print(f"cfc vs {honest_kind} (early-zone): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    spatial_significance = {}
+    for spatial_kind, base_kind in [
+        ("cfc_spatial", "cfc"),
+        ("nrc_honest_spatial", "nrc_honest"),
+        ("gru_honest_spatial", "gru_honest"),
+        ("ode_lstm_spatial", "ode_lstm_honest"),
+    ]:
+        for slice_name, by_kind in (("disocclusion", disocc_by_kind), ("stable", stable_by_kind),
+                                     ("early", early_by_kind)):
+            a = np.array(by_kind[spatial_kind])
+            b = np.array(by_kind[base_kind])
+            if np.isnan(a).any() or np.isnan(b).any():
+                continue
+            res = paired_bootstrap_significance(a, b)
+            spatial_significance[f"{spatial_kind}_vs_{base_kind}_{slice_name}"] = res
+            print(f"{spatial_kind:20s} vs {base_kind:14s} ({slice_name:12s}): "
+                  f"mean_diff={res['mean_diff']:.4f} CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] "
+                  f"significant={res['significant']}")
+
+    a = np.array(stable_by_kind["nrc_honest_spatial"])
+    b = np.array(stable_by_kind["cfc"])
+    if not (np.isnan(a).any() or np.isnan(b).any()):
+        res = paired_bootstrap_significance(a, b)
+        spatial_significance["nrc_honest_spatial_vs_cfc_stable"] = res
+        print(f"nrc_honest_spatial vs cfc (stable): mean_diff={res['mean_diff']:.4f} "
+              f"CI=[{res['ci_low']:.4f},{res['ci_high']:.4f}] significant={res['significant']}")
+
+    return dict(
+        early_by_kind=early_by_kind, floor_by_kind=floor_by_kind,
+        segtype_by_kind=segtype_by_kind, disocc_by_kind=disocc_by_kind,
+        stable_by_kind=stable_by_kind, warp_age_by_kind=warp_age_by_kind,
+        disocc_significance=disocc_significance, stable_significance=stable_significance,
+        hardjump_significance=hardjump_significance, spatial_significance=spatial_significance,
+        gate_diag=_aggregate_gate_diag(gate_diag_by_seed),
+        env_metadata=env_meta,
+    )
+
+
+def _compare_significance_dicts(name: str, sig_a: dict, sig_b: dict, verbose: bool = True) -> dict:
+    verdicts = {}
+    for key in sorted(set(sig_a) | set(sig_b)):
+        if key not in sig_a or key not in sig_b:
+            verdicts[key] = "MISSING_IN_ONE_RUN"
+            continue
+        a, b = sig_a[key], sig_b[key]
+        sign_agree = (a["mean_diff"] > 0) == (b["mean_diff"] > 0)
+        sig_agree = a["significant"] == b["significant"]
+        if not a["significant"] and not b["significant"]:
+            verdicts[key] = "CONFIRMED_TIE"
+        elif sign_agree and sig_agree:
+            verdicts[key] = "CONFIRMED"
+        else:
+            verdicts[key] = "UNCONFIRMED_escalate_n_seeds"
+        if verbose:
+            print(f"  [{name}] {key:22s}: run1(mean_diff={a['mean_diff']:+.4f}, sig={a['significant']}) "
+                  f"vs run2(mean_diff={b['mean_diff']:+.4f}, sig={b['significant']}) -> {verdicts[key]}")
+    return verdicts
+
+
+def run_cross_env_check(dataset_path=DEFAULT_DATASET, n_seeds=8, n_train_pixels=20, epochs=200,
+                         lr=1e-3, hidden_dim=32, light_schedule_total_duration=400.0,
+                         light_schedule_seed=0, gate_lr=None, verbose_per_seed=False):
+    print(f"\n{'='*70}\nCROSS-ENVIRONMENT CHECK: run 1/2 (обычный backend)\n{'='*70}")
+    run1 = run_multi_seed(
+        dataset_path=dataset_path, n_seeds=n_seeds, n_train_pixels=n_train_pixels,
+        epochs=epochs, lr=lr, hidden_dim=hidden_dim,
+        light_schedule_total_duration=light_schedule_total_duration,
+        light_schedule_seed=light_schedule_seed, verbose_per_seed=verbose_per_seed,
+        gate_lr=gate_lr, force_all_cpu=False,
+    )
+    print(f"\n{'='*70}\nCROSS-ENVIRONMENT CHECK: run 2/2 (forced-CPU)\n{'='*70}")
+    run2 = run_multi_seed(
+        dataset_path=dataset_path, n_seeds=n_seeds, n_train_pixels=n_train_pixels,
+        epochs=epochs, lr=lr, hidden_dim=hidden_dim,
+        light_schedule_total_duration=light_schedule_total_duration,
+        light_schedule_seed=light_schedule_seed, verbose_per_seed=verbose_per_seed,
+        gate_lr=gate_lr, force_all_cpu=True,
+    )
+
+    print(f"\n{'='*70}\nCROSS-ENVIRONMENT CHECK: сравнение "
+          f"({run1['env_metadata']['backend']} vs {run2['env_metadata']['backend']})\n{'='*70}")
+    verdicts = {}
+    for name in ("disocc_significance", "stable_significance", "hardjump_significance",
+                 "spatial_significance"):
+        verdicts[name] = _compare_significance_dicts(name, run1[name], run2[name])
+
+    n_unconfirmed = sum(1 for group in verdicts.values() for v in group.values()
+                         if v == "UNCONFIRMED_escalate_n_seeds")
+    print(f"\nИТОГ: {n_unconfirmed} сравнений UNCONFIRMED из "
+          f"{sum(len(g) for g in verdicts.values())} всего.")
+
+    return dict(run1=run1, run2=run2, verdicts=verdicts)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default=str(DEFAULT_DATASET))
+    parser.add_argument("--n_train_pixels", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--hidden_dim", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n_seeds", type=int, default=1)
+    parser.add_argument("--gate_lr", type=float, default=None)
+    parser.add_argument("--cross_env_check", action="store_true")
+    parser.add_argument("--skip_kinds", type=str, default="")
+    args = parser.parse_args()
+    if args.skip_kinds:
+        SKIP_KINDS.update(k.strip() for k in args.skip_kinds.split(",") if k.strip())
+    if args.cross_env_check:
+        run_cross_env_check(
+            dataset_path=args.dataset, n_seeds=max(args.n_seeds, MIN_N_SEEDS),
+            n_train_pixels=args.n_train_pixels, epochs=args.epochs, lr=args.lr,
+            hidden_dim=args.hidden_dim, gate_lr=args.gate_lr,
+        )
+    elif args.n_seeds == 1:
+        run(
+            dataset_path=args.dataset, n_train_pixels=args.n_train_pixels, epochs=args.epochs,
+            lr=args.lr, hidden_dim=args.hidden_dim, seed=args.seed, gate_lr=args.gate_lr,
+        )
+    else:
+        run_multi_seed(
+            dataset_path=args.dataset, n_seeds=args.n_seeds, n_train_pixels=args.n_train_pixels,
+            epochs=args.epochs, lr=args.lr, hidden_dim=args.hidden_dim, gate_lr=args.gate_lr,
+        )
