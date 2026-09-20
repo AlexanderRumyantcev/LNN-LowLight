@@ -120,16 +120,90 @@ class CfCProbeModule(nn.Module):
         hidden_dim: int = 32,
         use_staleness: bool = True,
         staleness_dim: int = 2,
+        use_hard_jump_reset: bool = False,
+        use_jump_output_skip: bool = False,
+        spatial_dim: int = 0,
+        use_mixed_memory: bool = False,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim
         self.use_staleness = use_staleness
         self.staleness_dim = staleness_dim
+        self.use_hard_jump_reset = use_hard_jump_reset
+        self.use_jump_output_skip = use_jump_output_skip
+        # mixed-memory RNN буфер (2026-08-22, TZ_stage3_cfc_mmrnn.md §2/§3) — Lechner & Hasani,
+        # "Mixed-Memory RNNs for Learning Long-term Dependencies in Irregularly Sampled Time
+        # Series" (OpenReview rOGm97YR22N, NeurIPS 2022). Доказанный в статье факт: continuous-
+        # time RNN страдает vanishing/exploding gradient на длинных зависимостях НЕЗАВИСИМО от
+        # выбора ODE-солвера (в т.ч. closed-form CfC); решение — отдельный, дискретный memory
+        # compartment (LSTM-подобный, c_state), разделённый с continuous-time состоянием h.
+        # Реализация — тот же рецепт, что у официальной библиотеки ncps
+        # (ncps.torch.cfc.CfC(mixed_memory=True), см. .venv/.../ncps/torch/cfc.py): на каждом
+        # шаге LSTM ПЕРЕД CfC-ячейкой, его h-выход идёт КАК h_prev В CfC-ячейку (не отдельный
+        # readout-путь). c_state никогда не проходит через continuous-time часть.
+        self.use_mixed_memory = use_mixed_memory
+        # spatial_dim (2026-08-20, models/spatial_features.py): позиционное кондиционирование
+        # (позиция+направление+normal+albedo, positional encoding) — закрывает найденный разрыв
+        # с настоящим NRC (Müller et al. 2021, чат/mempalace 2026-08-19/20). Применяется
+        # ОДИНАКОВО к CfC-B и honest-baseline'ам (nrc_honest/gru_honest/ode_lstm_honest) — иначе
+        # архитектурное сравнение теряет интерпретируемость (см. чат 2026-08-20). 0 по умолчанию
+        # = старое поведение без изменений (обратная совместимость).
+        self.spatial_dim = spatial_dim
 
-        input_dim = obs_dim + (staleness_dim if use_staleness else 0)
+        input_dim = obs_dim + (staleness_dim if use_staleness else 0) + spatial_dim
         self.cell = CfCProbeCell(input_dim=input_dim, hidden_dim=hidden_dim)
         self.readout = nn.Linear(hidden_dim, obs_dim)
+
+        if use_mixed_memory:
+            # §4 TZ_stage3: LSTMCell(input_dim, hidden_dim) добавляет 4*hidden_dim*
+            # (input_dim+hidden_dim+1) параметров — существенно относительно cell'а выше.
+            # Параметр-каунт ОБЯЗАТЕЛЬНО пересчитывать перед выводами (см. run скрипт).
+            self.memory_lstm = nn.LSTMCell(input_dim, hidden_dim)
+
+        # NJ-ODE-style жёсткий jump-канал (2026-08-16, ablation по мотивам Krach et al. 2022 /
+        # Herrera et al. 2021 — см. mempalace): dH_t = f(...)dt + (rho(X_t) - H_{t-})*du_t, вес
+        # jump-слагаемого В МОМЕНТ НАБЛЮДЕНИЯ равен 1 (полная замена H_t := rho(X_t)), НЕ мягкий
+        # blend, как sigma_tau в CfCProbeCell. rho здесь — ОТДЕЛЬНАЯ маленькая MLP от u_t (НЕ от
+        # h_prev вообще, как в базовой не-path-dependent версии NJ-ODE, Eq. 7-8) — сознательно
+        # простейший вариант гипотезы "у CfC-B нет отдельного hard-reset примитива для
+        # disocclusion", а не любое усложнение self.cell. Bounded output (Tanh) — как
+        # Definition 3.12 (bounded output neural networks) у Krach et al. Используется ТОЛЬКО
+        # если use_hard_jump_reset=True И вызывающий код передаёт disocc_seq в forward()
+        # (иначе полностью обратно совместимо со старым поведением).
+        if use_hard_jump_reset:
+            self.jump_map = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Tanh(),
+            )
+
+        # Output-level residual skip к obs_t (2026-08-19, ablation по найденному разрыву с
+        # NRDStyleBaseline.use_disocclusion_reset): jump_map выше заменяет СКРЫТОЕ состояние
+        # (bounded Tanh, hidden_dim) — чтобы попасть в out_t ~ obs_t, этому состоянию нужно
+        # пройти ЕЩЁ через общий self.readout, т.е. jump_map ОБЯЗАН выучить с нуля
+        # отображение, аппроксимирующее identity через две Tanh-прослойки, на ~6% кадров
+        # (disocclusion=1). У NRD's disocclusion-reset такого разрыва нет вообще: out_t = obs_t, ноль параметров.
+        # Здесь — НЕ трогаем h/jump_map/рекуррентную динамику (что переносится в следующий шаг
+        # как h_prev, остаётся как было, полностью совместимо со старым cfc_hardjump-поведением
+        # по состоянию) — правим ТОЛЬКО что репортируется как предсказание НА САМОМ шаге
+        # disocclusion=1: out_t := obs_t + jump_output_residual(h_jump), где
+        # jump_output_residual — ДОПОЛНИТЕЛЬНАЯ Linear(hidden_dim, obs_dim), инициализированная
+        # В НОЛЬ (вес и bias). При инициализации out_t == obs_t ТОЧНО (NRD-эквивалент), градиент
+        # учит МАЛУЮ ПОПРАВКУ поверх уже готового NRD-подобного ответа, а не identity с нуля —
+        # принципиально более лёгкая оптимизационная задача (zero-init residual, не
+        # random-init через 2 нелинейности). Отдельный флаг (НЕ переопределяет
+        # use_hard_jump_reset) — старое поведение cfc_hardjump остаётся доступным без изменений
+        # для сравнения (см. MODEL_KINDS: cfc_hardjump_skip — новый пункт, cfc_hardjump — как
+        # был). Требует use_hard_jump_reset=True (иначе нет jump_map/h_jump, к которым
+        # привязываться).
+        if use_jump_output_skip:
+            if not use_hard_jump_reset:
+                raise ValueError("use_jump_output_skip=True требует use_hard_jump_reset=True")
+            self.jump_output_residual = nn.Linear(hidden_dim, obs_dim)
+            nn.init.zeros_(self.jump_output_residual.weight)
+            nn.init.zeros_(self.jump_output_residual.bias)
 
     @staticmethod
     def build_input(
@@ -138,6 +212,7 @@ class CfCProbeModule(nn.Module):
         confidence: torch.Tensor | None = None,
         use_staleness: bool = True,
         extra_staleness: list[torch.Tensor] | None = None,
+        spatial: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Собирает u_t из сырых буферов пробы (§3.1) в формат входа модели.
@@ -158,21 +233,31 @@ class CfCProbeModule(nn.Module):
                                         из blender/disocclusion.reproject_and_check
                                         на паре соседних кадров — НЕ вычисляется этим
                                         модулем, подаётся уже готовым. Порядок каналов
-                                        должен совпадать с staleness_dim, который
-                                        модель получила в __init__.
+                                        должен совпадать с staleness_dim, который модель
+                                        получила в __init__.
+        spatial: [B, T, spatial_dim] позиционное кондиционирование (models/spatial_
+                                        features.py::build_spatial_conditioning,
+                                        2026-08-20) — None по умолчанию = старое
+                                        поведение без пространственного входа. Идёт
+                                        ПОСЛЕ staleness-вектора; должен совпадать со
+                                        spatial_dim, переданным модели в __init__.
         """
-        if not use_staleness:
-            return obs
-        if cold_start is None or confidence is None:
-            raise ValueError(
-                "use_staleness=True требует cold_start и confidence "
-                "(получить из spp-метаданных пробы, см. ТЗ §3.1/§3.2)"
-            )
-        components = [cold_start, confidence]
-        if extra_staleness:
-            components.extend(extra_staleness)
-        staleness = torch.stack(components, dim=-1)  # [B, T, staleness_dim]
-        return torch.cat([obs, staleness], dim=-1)
+        parts = [obs]
+        if use_staleness:
+            if cold_start is None or confidence is None:
+                raise ValueError(
+                    "use_staleness=True требует cold_start и confidence "
+                    "(получить из spp-метаданных пробы, см. ТЗ §3.1/§3.2)"
+                )
+            components = [cold_start, confidence]
+            if extra_staleness:
+                components.extend(extra_staleness)
+            parts.append(torch.stack(components, dim=-1))  # [B, T, staleness_dim]
+        if spatial is not None:
+            parts.append(spatial)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=-1)
 
     def forward(
         self,
@@ -180,6 +265,8 @@ class CfCProbeModule(nn.Module):
         dt_seq: torch.Tensor,
         h0: torch.Tensor | None = None,
         record_gates: bool = False,
+        disocc_seq: torch.Tensor | None = None,
+        c0: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -187,6 +274,14 @@ class CfCProbeModule(nn.Module):
             dt_seq: [B, T] или [B, T, 1] — Δt между последовательными обновлениями пробы
             h0:     [B, hidden_dim] или None (тогда нулевое состояние — cold-start)
             record_gates: сохранить ли sigma_tau по шагам (диагностика насыщения гейта)
+            disocc_seq: [B, T] 0/1, опционально — используется, ТОЛЬКО если
+                        use_hard_jump_reset=True (иначе игнорируется). На шагах, где
+                        disocc_seq==1, h полностью заменяется на self.jump_map(u_t)
+                        (NJ-ODE-style hard reset, вес 1, БЕЗ участия h_prev/обычного
+                        CfC-обновления на этом шаге) — см. докстринг __init__.
+            c0:     [B, hidden_dim] или None — начальное состояние LSTM-буфера
+                        mixed-memory (см. TZ_stage3 §3.2, Вариант A). Игнорируется,
+                        если use_mixed_memory=False. None -> нулевое (cold-start).
 
         Returns:
             (pred_seq, h_final):
@@ -194,6 +289,12 @@ class CfCProbeModule(nn.Module):
                           (причинно: шаг t не видит входов t+1..T-1)
                 h_final:  [B, hidden_dim] — финальное скрытое состояние (для continuation
                           между вызовами — проба живёт дольше одного обучающего окна)
+
+        Если use_mixed_memory=True, финальное состояние LSTM-буфера c_state сохраняется
+        в self.last_c_final ([B, hidden_dim]) — НЕ добавлено в кортеж возврата, чтобы не
+        ломать существующие вызовы (run_experiment_dense.py и т.д. распаковывают ровно
+        (pred, h_final)); вызывающий код, которому нужна continuation по c_state между
+        вызовами, читает атрибут явно и передаёт его следующим вызовом как c0.
         """
         if dt_seq.dim() == 2:
             dt_seq = dt_seq.unsqueeze(-1)  # [B, T] -> [B, T, 1]
@@ -204,23 +305,71 @@ class CfCProbeModule(nn.Module):
             if h0 is not None
             else torch.zeros(B, self.hidden_dim, device=u_seq.device, dtype=u_seq.dtype)
         )
+        c = None
+        if self.use_mixed_memory:
+            c = (
+                c0
+                if c0 is not None
+                else torch.zeros(B, self.hidden_dim, device=u_seq.device, dtype=u_seq.dtype)
+            )
+
+        use_jump = self.use_hard_jump_reset and disocc_seq is not None
+        if use_jump and disocc_seq.dim() == 1:
+            disocc_seq = disocc_seq.unsqueeze(0)  # на случай [T] без батч-оси
 
         outputs = []
         gate_log = [] if record_gates else None
         diag_logs = {k: [] for k in ("z", "g", "h_cand", "t_a", "t_b", "pre_sigmoid", "sigma_tau")} if record_gates else None
         for t in range(T):
-            h = self.cell(u_seq[:, t], h, dt_seq[:, t])
+            if self.use_mixed_memory:
+                # mmRNN-рецепт (ncps, mixed_memory=True): LSTM ПЕРЕД CfC-шагом каждый раз,
+                # его h-выход идёт КАК h_prev в CfC-ячейку. c обновляется здесь же, но НИКОГДА
+                # не проходит через continuous-time часть (self.cell) — см. §2 TZ_stage3.
+                h_for_cell, c = self.memory_lstm(u_seq[:, t], (h, c))
+            else:
+                h_for_cell = h
+            h_cfc = self.cell(u_seq[:, t], h_for_cell, dt_seq[:, t])
+            if use_jump:
+                # NJ-ODE-style: H_t := rho(u_t) ПОЛНОСТЬЮ (вес 1, без h_prev/h_cfc на этом шаге)
+                # на шагах disocc==1; иначе обычное CfC-обновление без изменений. Эта часть НЕ
+                # меняется use_jump_output_skip'ом — рекуррентная динамика (что несётся в
+                # следующий шаг как h_prev) идентична исходному cfc_hardjump.
+                h_jump = self.jump_map(u_seq[:, t])
+                mask = disocc_seq[:, t].to(h_cfc.dtype).unsqueeze(-1)  # [B,1]
+                h = mask * h_jump + (1.0 - mask) * h_cfc
+                if self.use_mixed_memory:
+                    # TZ_stage3 §3.2, Вариант A: на disocc==1 сбрасывается И c_state тоже —
+                    # накопленная LSTM-память с прошлой геометрии не должна пережить разрыв
+                    # причинности. Переиспользуем h_jump (тот же bounded Tanh-выход) как reset-
+                    # цель для c — простейшая инстанциация Варианта A (не вводит вторую сеть
+                    # rho_c, см. обсуждение вариантов в TZ), не отдельная сеть.
+                    c = mask * h_jump + (1.0 - mask) * c
+                if self.use_jump_output_skip:
+                    # См. докстринг __init__: меняется ТОЛЬКО репортируемое предсказание на
+                    # шаге disocc==1, не h. obs_component — сырые каналы наблюдения (всегда
+                    # первые obs_dim каналов u_t, см. build_input: cat([obs, staleness])).
+                    obs_component = u_seq[:, t, : self.obs_dim]
+                    out_jump = obs_component + self.jump_output_residual(h_jump)
+                    out = mask * out_jump + (1.0 - mask) * self.readout(h_cfc)
+                else:
+                    out = self.readout(h)
+            else:
+                h = h_cfc
+                out = self.readout(h)
             if record_gates:
                 gate_log.append(self.cell.last_sigma_tau)
                 for k in diag_logs:
                     diag_logs[k].append(self.cell.last_gate_diag[k])
-            outputs.append(self.readout(h))
+            outputs.append(out)
 
         if record_gates:
             self.last_gate_log = torch.stack(gate_log, dim=1)  # [B, T, hidden_dim]
             # каждый ключ — [B, T, hidden_dim]; держит граф, если вызывающий код не под no_grad()
             # (нужно full_gate_diagnostics для backward через t_a/t_b)
             self.last_diag_log = {k: torch.stack(v, dim=1) for k, v in diag_logs.items()}
+
+        if self.use_mixed_memory:
+            self.last_c_final = c
 
         return torch.stack(outputs, dim=1), h
 
@@ -243,7 +392,7 @@ def calibrate_time_gate_init(model: "CfCProbeModule", u_seq: torch.Tensor, dt_se
 
     Почему масштабируем ИМЕННО W_a (не W_b, не backbone): W_b — это offset (значение гейта при
     dt->0), его масштаб не связан с чувствительностью к dt и трогать не нужно. t_a должен
-    определять НАСКОЛЬКО сильно сигмоида реагирует на log1p(dt) — это единственный параметр,
+    определять НАСКОЛЬКО СИЛЬНО сигмоида реагирует на log1p(dt) — это единственный параметр,
     отвечающий за эту чувствительность (см. полный разбор роли t_a в чате/mempalace 2026-08-01).
 
     target_pre_sigmoid_std=2.0 — эвристика: sigmoid(±2) ~= {0.12, 0.88}, т.е. typical dt должен
@@ -282,7 +431,9 @@ def calibrate_time_gate_init(model: "CfCProbeModule", u_seq: torch.Tensor, dt_se
 # ---------------------------------------------------------------------------
 def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: torch.Tensor,
                            true: torch.Tensor = None, seg_type: "np.ndarray" = None,
-                           segment_names: dict | None = None, label: str = "sigma_tau",
+                           segment_names: dict | None = None,
+                           disocclusion_flag: "np.ndarray | torch.Tensor" = None,
+                           label: str = "sigma_tau",
                            verbose: bool = True) -> dict:
     """
     Один проход даёт срез сразу по ВСЕМ параметрам CfC-ячейки (2026-08-01, расширено по запросу
@@ -306,9 +457,19 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
       - sigma_tau/pre_sigmoid, забинченные НАПРЯМУЮ по величине dt (не по offset-since-jump,
         который является другой переменной и может не коррелировать с dt пробы) — прямая
         проверка "реагирует ли гейт хотя бы на собственный прямой вход".
+      - если передан `disocclusion_flag` (2026-08-11, TZ_stage1b_gate_theory_sweep.md §1):
+        разбивка sat_low/sat_high/|t_a|/|t_b|/sigma_tau по disocclusion=0/1 отдельно
+        (`by_disocclusion`), И, если ОДНОВРЕМЕННО передан seg_type, совместная разбивка
+        по (seg_type × disocclusion_flag) (`by_seg_type_x_disocclusion`) — раньше это
+        требовало одноразового патча в run_experiment_dense.py поверх model.last_diag_log
+        (см. mempalace, сессия 2026-08-09), теперь встроено сюда как основной путь, чтобы
+        разные прогоны (sweep по gate_lr/lr_Wa/lr_Wb) давали сравнимые таблицы без
+        ad hoc-кода на каждый прогон.
 
     u_seq: [B, T, input_dim], dt_seq: [B, T] или [B, T, 1], true: [B, T, obs_dim] опционально.
     seg_type: [B, T] int-коды сегментов (см. evaluation.metrics.SEGMENT_NAMES), опционально.
+    disocclusion_flag: [B, T] 0/1 (bool-совместимый), опционально. Форма ДОЛЖНА совпадать
+        с первыми двумя измерениями z/sigma_tau/t_a/t_b (та же конвенция, что у seg_type).
     """
     import numpy as np  # локальный импорт — модуль не тянет numpy на верхнем уровне
 
@@ -358,16 +519,63 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
         "grad": grad_info,
     }
 
-    if seg_type is not None:
-        seg_t = torch.as_tensor(seg_type)
-        names = segment_names or {0: "static", 1: "step", 2: "drift"}
+    # Единая функция сбора статистики по произвольной boolean-маске [B, T] — используется
+    # и для seg_type, и для disocclusion_flag, и для их пересечения (2026-08-11, TZ
+    # stage1b_gate_theory_sweep.md §1), чтобы разные разрезы были ПОЛНОСТЬЮ сравнимы между
+    # собой (одни и те же поля), а не разного состава, как было раньше (by_seg_type содержал
+    # только z_norm/t_a_mean/t_b_mean, без sat_low/sat_high/sigma_tau — их приходилось
+    # доставать отдельным одноразовым кодом, см. старый "[disocclusion gate reaction check]"
+    # патч в run_experiment_dense.py).
+    def _masked_gate_stats(mask: torch.Tensor) -> dict | None:
+        if not mask.any():
+            return None
+        st = sig_tau[mask]
+        return dict(
+            n=int(mask.sum()),
+            sigma_tau_mean=float(st.mean()), sigma_tau_std=float(st.std()),
+            sat_low_frac=float((st < 0.02).float().mean()),
+            sat_high_frac=float((st > 0.98).float().mean()),
+            t_a_mean=float(t_a[mask].mean()), t_a_abs_mean=float(t_a[mask].abs().mean()),
+            t_b_mean=float(t_b[mask].mean()), t_b_abs_mean=float(t_b[mask].abs().mean()),
+            z_norm_mean=float(z[mask].norm(dim=-1).mean()),
+        )
+
+    # Обе маски принудительно приводим к устройству z (не полагаемся на то, что вызывающий
+    # код передал seg_type/disocclusion_flag уже на нужном device — оба тензора могли прийти
+    # с разных источников, как выяснилось на MPS: seg_type собирается через np.stack на CPU,
+    # а disocclusion_flag вызывающий код обычно уже переносит на device модели).
+    seg_t = torch.as_tensor(seg_type, device=z.device) if seg_type is not None else None
+    seg_names = segment_names or {0: "static", 1: "step", 2: "drift"}
+    if seg_t is not None:
         by_seg = {}
-        for code, name in names.items():
-            mask = seg_t == code
-            if mask.any():
-                by_seg[name] = dict(z_norm_mean=float(z[mask].norm(dim=-1).mean()),
-                                     t_a_mean=float(t_a[mask].mean()), t_b_mean=float(t_b[mask].mean()))
+        for code, name in seg_names.items():
+            stats_ = _masked_gate_stats(seg_t == code)
+            if stats_ is not None:
+                by_seg[name] = stats_
         result["by_seg_type"] = by_seg
+
+    disocc_t = None
+    if disocclusion_flag is not None:
+        disocc_t = torch.as_tensor(disocclusion_flag, device=z.device).bool()
+        # приводим к [B, T], если пришло с лишней последней размерностью (как dt_seq выше)
+        if disocc_t.dim() > 2:
+            disocc_t = disocc_t.reshape(disocc_t.shape[0], disocc_t.shape[1])
+        by_disocc = {}
+        for name, mask in (("disocclusion=1", disocc_t), ("disocclusion=0", ~disocc_t)):
+            stats_ = _masked_gate_stats(mask)
+            if stats_ is not None:
+                by_disocc[name] = stats_
+        result["by_disocclusion"] = by_disocc
+
+        if seg_t is not None:
+            by_joint = {}
+            for code, seg_name in seg_names.items():
+                for disocc_val, disocc_name in ((True, "disocc=1"), (False, "disocc=0")):
+                    mask = (seg_t == code) & (disocc_t == disocc_val)
+                    stats_ = _masked_gate_stats(mask)
+                    if stats_ is not None:
+                        by_joint[f"{seg_name}/{disocc_name}"] = stats_
+            result["by_seg_type_x_disocclusion"] = by_joint
 
     # --- dt-распределение vs масштаб t_a (2026-08-01, обновлено под log1p(dt)-фикс) -----------
     # dt_seq на входе может быть [B,T] или [B,T,1]; приводим к [B,T] для перцентилей.
@@ -428,9 +636,22 @@ def full_gate_diagnostics(model: "CfCProbeModule", u_seq: torch.Tensor, dt_seq: 
                 wn, bn = gi['weight_grad_norm'], gi['bias_grad_norm']
                 print(f"      grad[{name:8s}]: weight_norm={wn:.5f} bias_norm={bn:.5f}" if wn is not None
                       else f"      grad[{name:8s}]: None (нет градиента)")
+        def _print_group_row(prefix_width: int, name: str, s: dict) -> None:
+            print(f"      {name:<{prefix_width}s} n={s['n']:6d} "
+                  f"sigma_tau={s['sigma_tau_mean']:.3f}±{s['sigma_tau_std']:.3f} "
+                  f"sat_low={s['sat_low_frac']:.1%} sat_high={s['sat_high_frac']:.1%} "
+                  f"|t_a|={s['t_a_abs_mean']:.4f} |t_b|={s['t_b_abs_mean']:.4f} "
+                  f"z_norm={s['z_norm_mean']:.3f}")
+
         if "by_seg_type" in result:
             for seg, s in result["by_seg_type"].items():
-                print(f"      seg={seg:7s}     z_norm={s['z_norm_mean']:.3f} t_a={s['t_a_mean']:.3f} t_b={s['t_b_mean']:.3f}")
+                _print_group_row(9, f"seg={seg}", s)
+        if "by_disocclusion" in result:
+            for name, s in result["by_disocclusion"].items():
+                _print_group_row(16, name, s)
+        if "by_seg_type_x_disocclusion" in result:
+            for name, s in result["by_seg_type_x_disocclusion"].items():
+                _print_group_row(18, name, s)
         dd = result["dt_distribution"]
         print(f"      dt dist:        p01={dd['p01']:.3f} p10={dd['p10']:.3f} p50={dd['p50']:.3f} "
               f"p90={dd['p90']:.3f} p99={dd['p99']:.3f} max={dd['max']:.3f}")
